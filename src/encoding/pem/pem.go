@@ -25,10 +25,11 @@ import (
 // where Headers is a possibly empty sequence of Key: Value lines.
 type Block struct {
 	Type    string   // The type, taken from the preamble (i.e. "RSA PRIVATE KEY").
-	Bytes   []byte   // The decoded bytes of the contents. Typically a DER encoded ASN.1 structure.
 	Headers []Header // Optional headers.
+	Bytes   []byte   // The decoded bytes of the contents. Typically a DER encoded ASN.1 structure.
 }
 
+// Header is a key value pair used in the header of a PEM Block
 type Header struct {
 	Key   string
 	Value string
