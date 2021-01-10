@@ -30,6 +30,11 @@ type Block struct {
 	Bytes   []byte            // The decoded bytes of the contents. Typically a DER encoded ASN.1 structure.
 }
 
+type Header struct {
+	Key   string
+	Value string
+}
+
 // getLine results the first \r\n or \n delineated line from the given byte
 // array. The line does not include trailing whitespace or the trailing new
 // line bytes. The remainder of the byte array (also not including the new line
