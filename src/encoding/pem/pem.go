@@ -12,7 +12,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
-	"sort"
 	"strings"
 )
 
@@ -25,14 +24,82 @@ import (
 //    -----END Type-----
 // where Headers is a possibly empty sequence of Key: Value lines.
 type Block struct {
-	Type    string            // The type, taken from the preamble (i.e. "RSA PRIVATE KEY").
-	Headers map[string]string // Optional headers.
-	Bytes   []byte            // The decoded bytes of the contents. Typically a DER encoded ASN.1 structure.
+	Type    string   // The type, taken from the preamble (i.e. "RSA PRIVATE KEY").
+	Bytes   []byte   // The decoded bytes of the contents. Typically a DER encoded ASN.1 structure.
+	Headers []Header // Optional headers.
 }
 
 type Header struct {
 	Key   string
 	Value string
+}
+
+// SetHeader will scan the header list and set the corresponding header or
+// create one if the header has not already been set. If the header is found
+// more than once this will return an error.
+func (x *Block) SetHeader(key string, val string) (err error) {
+	found := -1
+	for i, h := range x.Headers {
+		if h.Key == key {
+			if found > -1 {
+				return errors.New("pem: header key found more than once")
+			} else {
+				found = i
+			}
+		}
+	}
+	if found >= 0 {
+		x.Headers[found].Value = val
+	} else {
+		x.Headers = append(x.Headers, Header{Key: key, Value: val})
+	}
+	return
+}
+
+// GetHeader will scan the header list and return the associated Header
+// with the given key value. If the key is matches multiple Headers,
+// this will return an error.
+func (x *Block) GetHeader(key string) (ret *Header, err error) {
+	found := false
+	for _, h := range x.Headers {
+		if h.Key == key {
+			if found {
+				return nil, errors.New("pem: header key found more than once")
+			} else {
+				ret = &Header{Key: h.Key, Value: h.Value}
+			}
+		}
+	}
+	return
+}
+
+// DeleteHeader will scan the header list and delete the associated Header
+// with the given key value. If the key is matches multiple Headers,
+// this will return an error.
+func (x *Block) DeleteHeader(key string) (err error) {
+	found := -1
+	for i, h := range x.Headers {
+		if h.Key == key {
+			if found > -1 {
+				return errors.New("pem: header key found more than once")
+			} else {
+				found = i
+			}
+		}
+	}
+	if found >= 0 {
+		x.Headers = append(x.Headers[:found], x.Headers[found+1:]...)
+	}
+	return
+}
+
+// Copy will return a copy of the PEM Block
+func (x *Block) Copy() (ret Block) {
+	ret.Type = x.Type
+	ret.Bytes = x.Bytes
+	ret.Headers = make([]Header, len(x.Headers))
+	copy(ret.Headers, x.Headers)
+	return
 }
 
 // getLine results the first \r\n or \n delineated line from the given byte
@@ -107,11 +174,11 @@ func Decode(data []byte) (p *Block, rest []byte) {
 	typeLine = typeLine[0 : len(typeLine)-len(pemEndOfLine)]
 
 	p = &Block{
-		Headers: make(map[string]string),
+		Headers: []Header{},
 		Type:    string(typeLine),
 	}
 
-	var prev_key string
+	h := &Header{}
 	for {
 		// This loop terminates because getLine's second result is
 		// always smaller than its argument.
@@ -120,9 +187,9 @@ func Decode(data []byte) (p *Block, rest []byte) {
 		}
 		line, next := getLine(rest)
 
-		if len(line) > 1 && (line[0] == 0x20 || line[0] == 0x9) && prev_key != "" {
+		if len(line) > 1 && (line[0] == 0x20 || line[0] == 0x9) && h.Key != "" {
 			// Joins values that spread across lines.
-			p.Headers[prev_key] = p.Headers[prev_key] + string(bytes.TrimSpace(line))
+			h.Value = h.Value + string(bytes.TrimSpace(line))
 			rest = next
 		} else {
 			i := bytes.IndexByte(line, ':')
@@ -130,13 +197,19 @@ func Decode(data []byte) (p *Block, rest []byte) {
 				break
 			}
 
+			if h.Key != "" {
+				p.Headers = append(p.Headers, *h)
+				h = &Header{}
+			}
 			key, val := line[:i], line[i+1:]
-			key = bytes.TrimSpace(key)
-			val = bytes.TrimSpace(val)
-			p.Headers[string(key)] = string(val)
-			prev_key = string(key)
+			h.Key = string(bytes.TrimSpace(key))
+			h.Value = string(bytes.TrimSpace(val))
 			rest = next
 		}
+	}
+	if h.Key != "" {
+		p.Headers = append(p.Headers, *h)
+		h = &Header{}
 	}
 
 	var endIndex, endTrailerIndex int
@@ -372,8 +445,8 @@ func writeHeader(out io.Writer, k, v string) (err error) {
 // Encode writes the PEM encoding of b to out.
 func Encode(out io.Writer, b *Block) error {
 	// Check for invalid block before writing any output.
-	for k := range b.Headers {
-		if strings.Contains(k, ":") {
+	for _, h := range b.Headers {
+		if strings.Contains(h.Key, ":") {
 			return errors.New("pem: cannot encode a header key that contains a colon")
 		}
 	}
@@ -390,27 +463,25 @@ func Encode(out io.Writer, b *Block) error {
 
 	if len(b.Headers) > 0 {
 		const procType = "Proc-Type"
-		h := make([]string, 0, len(b.Headers))
-		hasProcType := false
-		for k := range b.Headers {
-			if k == procType {
-				hasProcType = true
-				continue
-			}
-			h = append(h, k)
-		}
+
 		// The Proc-Type header must be written first.
 		// See RFC 1421, section 4.6.1.1
-		if hasProcType {
-			if err := writeHeader(out, procType, b.Headers[procType]); err != nil {
+		procTypeHeader, err := b.GetHeader(procType)
+		if err != nil {
+			return err
+		}
+
+		if procTypeHeader != nil {
+			if err := writeHeader(out, procType, procTypeHeader.Value); err != nil {
 				return err
 			}
 		}
-		// For consistency of output, write other headers sorted by key.
-		sort.Strings(h)
-		for _, k := range h {
-			if err := writeHeader(out, k, b.Headers[k]); err != nil {
-				return err
+
+		for _, h := range b.Headers {
+			if h.Key != procType {
+				if err := writeHeader(out, h.Key, h.Value); err != nil {
+					return err
+				}
 			}
 		}
 		if _, err := out.Write(nl); err != nil {
