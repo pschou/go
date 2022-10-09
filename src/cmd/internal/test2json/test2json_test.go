@@ -10,7 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -28,7 +28,7 @@ func TestGolden(t *testing.T) {
 	for _, file := range files {
 		name := strings.TrimSuffix(filepath.Base(file), ".test")
 		t.Run(name, func(t *testing.T) {
-			orig, err := ioutil.ReadFile(file)
+			orig, err := os.ReadFile(file)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -46,13 +46,13 @@ func TestGolden(t *testing.T) {
 			if *update {
 				js := strings.TrimSuffix(file, ".test") + ".json"
 				t.Logf("rewriting %s", js)
-				if err := ioutil.WriteFile(js, buf.Bytes(), 0666); err != nil {
+				if err := os.WriteFile(js, buf.Bytes(), 0666); err != nil {
 					t.Fatal(err)
 				}
 				return
 			}
 
-			want, err := ioutil.ReadFile(strings.TrimSuffix(file, ".test") + ".json")
+			want, err := os.ReadFile(strings.TrimSuffix(file, ".test") + ".json")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -145,7 +145,7 @@ func writeAndKill(w io.Writer, b []byte) {
 // and fails the test with a useful message if they don't match.
 func diffJSON(t *testing.T, have, want []byte) {
 	t.Helper()
-	type event map[string]interface{}
+	type event map[string]any
 
 	// Parse into events, one per line.
 	parseEvents := func(b []byte) ([]event, []string) {

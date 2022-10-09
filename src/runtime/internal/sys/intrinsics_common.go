@@ -45,6 +45,10 @@ var ntz8tab = [256]uint8{
 }
 
 // len64 returns the minimum number of bits required to represent x; the result is 0 for x == 0.
+//
+// nosplit because this is used in src/runtime/histogram.go, which make run in sensitive contexts.
+//
+//go:nosplit
 func Len64(x uint64) (n int) {
 	if x >= 1<<32 {
 		x >>= 32
@@ -141,3 +145,18 @@ func TrailingZeros8(x uint8) int {
 func Len8(x uint8) int {
 	return int(len8tab[x])
 }
+
+// Prefetch prefetches data from memory addr to cache
+//
+// AMD64: Produce PREFETCHT0 instruction
+//
+// ARM64: Produce PRFM instruction with PLDL1KEEP option
+func Prefetch(addr uintptr) {}
+
+// PrefetchStreamed prefetches data from memory addr, with a hint that this data is being streamed.
+// That is, it is likely to be accessed very soon, but only once. If possible, this will avoid polluting the cache.
+//
+// AMD64: Produce PREFETCHNTA instruction
+//
+// ARM64: Produce PRFM instruction with PLDL1STRM option
+func PrefetchStreamed(addr uintptr) {}

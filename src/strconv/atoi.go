@@ -33,20 +33,36 @@ func (e *NumError) Error() string {
 
 func (e *NumError) Unwrap() error { return e.Err }
 
+// cloneString returns a string copy of x.
+//
+// All ParseXXX functions allow the input string to escape to the error value.
+// This hurts strconv.ParseXXX(string(b)) calls where b is []byte since
+// the conversion from []byte must allocate a string on the heap.
+// If we assume errors are infrequent, then we can avoid escaping the input
+// back to the output by copying it first. This allows the compiler to call
+// strconv.ParseXXX without a heap allocation for most []byte to string
+// conversions, since it can now prove that the string cannot escape Parse.
+//
+// TODO: Use strings.Clone instead? However, we cannot depend on "strings"
+// since it incurs a transitive dependency on "unicode".
+// Either move strings.Clone to an internal/bytealg or make the
+// "strings" to "unicode" dependency lighter (see https://go.dev/issue/54098).
+func cloneString(x string) string { return string([]byte(x)) }
+
 func syntaxError(fn, str string) *NumError {
-	return &NumError{fn, str, ErrSyntax}
+	return &NumError{fn, cloneString(str), ErrSyntax}
 }
 
 func rangeError(fn, str string) *NumError {
-	return &NumError{fn, str, ErrRange}
+	return &NumError{fn, cloneString(str), ErrRange}
 }
 
 func baseError(fn, str string, base int) *NumError {
-	return &NumError{fn, str, errors.New("invalid base " + Itoa(base))}
+	return &NumError{fn, cloneString(str), errors.New("invalid base " + Itoa(base))}
 }
 
 func bitSizeError(fn, str string, bitSize int) *NumError {
-	return &NumError{fn, str, errors.New("invalid bit size " + Itoa(bitSize))}
+	return &NumError{fn, cloneString(str), errors.New("invalid bit size " + Itoa(bitSize))}
 }
 
 const intSize = 32 << (^uint(0) >> 63)
@@ -57,6 +73,8 @@ const IntSize = intSize
 const maxUint64 = 1<<64 - 1
 
 // ParseUint is like ParseInt but for unsigned numbers.
+//
+// A sign prefix is not permitted.
 func ParseUint(s string, base int, bitSize int) (uint64, error) {
 	const fnParseUint = "ParseUint"
 
@@ -143,7 +161,7 @@ func ParseUint(s string, base int, bitSize int) (uint64, error) {
 
 		n1 := n + uint64(d)
 		if n1 < n || n1 > maxVal {
-			// n+v overflows
+			// n+d overflows
 			return maxVal, rangeError(fnParseUint, s0)
 		}
 		n = n1
@@ -159,10 +177,13 @@ func ParseUint(s string, base int, bitSize int) (uint64, error) {
 // ParseInt interprets a string s in the given base (0, 2 to 36) and
 // bit size (0 to 64) and returns the corresponding value i.
 //
+// The string may begin with a leading sign: "+" or "-".
+//
 // If the base argument is 0, the true base is implied by the string's
-// prefix: 2 for "0b", 8 for "0" or "0o", 16 for "0x", and 10 otherwise.
-// Also, for argument base 0 only, underscore characters are permitted
-// as defined by the Go syntax for integer literals.
+// prefix following the sign (if present): 2 for "0b", 8 for "0" or "0o",
+// 16 for "0x", and 10 otherwise. Also, for argument base 0 only,
+// underscore characters are permitted as defined by the Go syntax for
+// [integer literals].
 //
 // The bitSize argument specifies the integer type
 // that the result must fit into. Bit sizes 0, 8, 16, 32, and 64
@@ -176,6 +197,8 @@ func ParseUint(s string, base int, bitSize int) (uint64, error) {
 // signed integer of the given size, err.Err = ErrRange and the
 // returned value is the maximum magnitude integer of the
 // appropriate bitSize and sign.
+//
+// [integer literals]: https://go.dev/ref/spec#Integer_literals
 func ParseInt(s string, base int, bitSize int) (i int64, err error) {
 	const fnParseInt = "ParseInt"
 
@@ -198,7 +221,7 @@ func ParseInt(s string, base int, bitSize int) (i int64, err error) {
 	un, err = ParseUint(s, base, bitSize)
 	if err != nil && err.(*NumError).Err != ErrRange {
 		err.(*NumError).Func = fnParseInt
-		err.(*NumError).Num = s0
+		err.(*NumError).Num = cloneString(s0)
 		return 0, err
 	}
 
@@ -232,7 +255,7 @@ func Atoi(s string) (int, error) {
 		if s[0] == '-' || s[0] == '+' {
 			s = s[1:]
 			if len(s) < 1 {
-				return 0, &NumError{fnAtoi, s0, ErrSyntax}
+				return 0, syntaxError(fnAtoi, s0)
 			}
 		}
 
@@ -240,7 +263,7 @@ func Atoi(s string) (int, error) {
 		for _, ch := range []byte(s) {
 			ch -= '0'
 			if ch > 9 {
-				return 0, &NumError{fnAtoi, s0, ErrSyntax}
+				return 0, syntaxError(fnAtoi, s0)
 			}
 			n = n*10 + int(ch)
 		}

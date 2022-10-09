@@ -36,65 +36,8 @@ URLs of a specified form. The requests have no query parameters, so even
 a site serving from a fixed file system (including a file:/// URL)
 can be a module proxy.
 
-The GET requests sent to a Go module proxy are:
-
-GET $GOPROXY/<module>/@v/list returns a list of known versions of the given
-module, one per line.
-
-GET $GOPROXY/<module>/@v/<version>.info returns JSON-formatted metadata
-about that version of the given module.
-
-GET $GOPROXY/<module>/@v/<version>.mod returns the go.mod file
-for that version of the given module.
-
-GET $GOPROXY/<module>/@v/<version>.zip returns the zip archive
-for that version of the given module.
-
-GET $GOPROXY/<module>/@latest returns JSON-formatted metadata about the
-latest known version of the given module in the same format as
-<module>/@v/<version>.info. The latest version should be the version of
-the module the go command may use if <module>/@v/list is empty or no
-listed version is suitable. <module>/@latest is optional and may not
-be implemented by a module proxy.
-
-When resolving the latest version of a module, the go command will request
-<module>/@v/list, then, if no suitable versions are found, <module>/@latest.
-The go command prefers, in order: the semantically highest release version,
-the semantically highest pre-release version, and the chronologically
-most recent pseudo-version. In Go 1.12 and earlier, the go command considered
-pseudo-versions in <module>/@v/list to be pre-release versions, but this is
-no longer true since Go 1.13.
-
-To avoid problems when serving from case-sensitive file systems,
-the <module> and <version> elements are case-encoded, replacing every
-uppercase letter with an exclamation mark followed by the corresponding
-lower-case letter: github.com/Azure encodes as github.com/!azure.
-
-The JSON-formatted metadata about a given module corresponds to
-this Go data structure, which may be expanded in the future:
-
-    type Info struct {
-        Version string    // version string
-        Time    time.Time // commit time
-    }
-
-The zip archive for a specific version of a given module is a
-standard zip file that contains the file tree corresponding
-to the module's source code and related files. The archive uses
-slash-separated paths, and every file path in the archive must
-begin with <module>@<version>/, where the module and version are
-substituted directly, not case-encoded. The root of the module
-file tree corresponds to the <module>@<version>/ prefix in the
-archive.
-
-Even when downloading directly from version control systems,
-the go command synthesizes explicit info, mod, and zip files
-and stores them in its local cache, $GOPATH/pkg/mod/cache/download,
-the same as if it had downloaded them directly from a proxy.
-The cache layout is the same as the proxy URL space, so
-serving $GOPATH/pkg/mod/cache/download at (or copying it to)
-https://example.com/proxy would let other users access those
-cached module versions with GOPROXY=https://example.com/proxy.
+For details on the GOPROXY protocol, see
+https://golang.org/ref/mod#goproxy-protocol.
 `,
 }
 
@@ -244,6 +187,10 @@ type proxyRepo struct {
 	url         *url.URL
 	path        string
 	redactedURL string
+
+	listLatestOnce sync.Once
+	listLatest     *RevInfo
+	listLatestErr  error
 }
 
 func newProxyRepo(baseURL, path string) (Repo, error) {
@@ -271,11 +218,17 @@ func newProxyRepo(baseURL, path string) (Repo, error) {
 	redactedURL := base.Redacted()
 	base.Path = strings.TrimSuffix(base.Path, "/") + "/" + enc
 	base.RawPath = strings.TrimSuffix(base.RawPath, "/") + "/" + pathEscape(enc)
-	return &proxyRepo{base, path, redactedURL}, nil
+	return &proxyRepo{base, path, redactedURL, sync.Once{}, nil, nil}, nil
 }
 
 func (p *proxyRepo) ModulePath() string {
 	return p.path
+}
+
+var errProxyReuse = fmt.Errorf("proxy does not support CheckReuse")
+
+func (p *proxyRepo) CheckReuse(old *codehost.Origin) error {
+	return errProxyReuse
 }
 
 // versionError returns err wrapped in a ModuleError for p.path.
@@ -285,7 +238,7 @@ func (p *proxyRepo) versionError(version string, err error) error {
 			Path: p.path,
 			Err: &module.InvalidVersionError{
 				Version: version,
-				Pseudo:  IsPseudoVersion(version),
+				Pseudo:  module.IsPseudoVersion(version),
 				Err:     err,
 			},
 		}
@@ -304,10 +257,17 @@ func (p *proxyRepo) getBytes(path string) ([]byte, error) {
 		return nil, err
 	}
 	defer body.Close()
-	return io.ReadAll(body)
+
+	b, err := io.ReadAll(body)
+	if err != nil {
+		// net/http doesn't add context to Body errors, so add it here.
+		// (See https://go.dev/issue/52727.)
+		return b, &url.Error{Op: "read", URL: pathpkg.Join(p.redactedURL, path), Err: err}
+	}
+	return b, nil
 }
 
-func (p *proxyRepo) getBody(path string) (io.ReadCloser, error) {
+func (p *proxyRepo) getBody(path string) (r io.ReadCloser, err error) {
 	fullPath := pathpkg.Join(p.url.Path, path)
 
 	target := *p.url
@@ -325,48 +285,59 @@ func (p *proxyRepo) getBody(path string) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
-func (p *proxyRepo) Versions(prefix string) ([]string, error) {
+func (p *proxyRepo) Versions(prefix string) (*Versions, error) {
 	data, err := p.getBytes("@v/list")
 	if err != nil {
+		p.listLatestOnce.Do(func() {
+			p.listLatest, p.listLatestErr = nil, p.versionError("", err)
+		})
 		return nil, p.versionError("", err)
 	}
 	var list []string
-	for _, line := range strings.Split(string(data), "\n") {
+	allLine := strings.Split(string(data), "\n")
+	for _, line := range allLine {
 		f := strings.Fields(line)
-		if len(f) >= 1 && semver.IsValid(f[0]) && strings.HasPrefix(f[0], prefix) && !IsPseudoVersion(f[0]) {
+		if len(f) >= 1 && semver.IsValid(f[0]) && strings.HasPrefix(f[0], prefix) && !module.IsPseudoVersion(f[0]) {
 			list = append(list, f[0])
 		}
 	}
-	SortVersions(list)
-	return list, nil
+	p.listLatestOnce.Do(func() {
+		p.listLatest, p.listLatestErr = p.latestFromList(allLine)
+	})
+	semver.Sort(list)
+	return &Versions{List: list}, nil
 }
 
 func (p *proxyRepo) latest() (*RevInfo, error) {
-	data, err := p.getBytes("@v/list")
-	if err != nil {
-		return nil, p.versionError("", err)
-	}
+	p.listLatestOnce.Do(func() {
+		data, err := p.getBytes("@v/list")
+		if err != nil {
+			p.listLatestErr = p.versionError("", err)
+			return
+		}
+		list := strings.Split(string(data), "\n")
+		p.listLatest, p.listLatestErr = p.latestFromList(list)
+	})
+	return p.listLatest, p.listLatestErr
+}
 
+func (p *proxyRepo) latestFromList(allLine []string) (*RevInfo, error) {
 	var (
-		bestTime             time.Time
-		bestTimeIsFromPseudo bool
-		bestVersion          string
+		bestTime    time.Time
+		bestVersion string
 	)
-
-	for _, line := range strings.Split(string(data), "\n") {
+	for _, line := range allLine {
 		f := strings.Fields(line)
 		if len(f) >= 1 && semver.IsValid(f[0]) {
 			// If the proxy includes timestamps, prefer the timestamp it reports.
 			// Otherwise, derive the timestamp from the pseudo-version.
 			var (
-				ft             time.Time
-				ftIsFromPseudo = false
+				ft time.Time
 			)
 			if len(f) >= 2 {
 				ft, _ = time.Parse(time.RFC3339, f[1])
-			} else if IsPseudoVersion(f[0]) {
-				ft, _ = PseudoVersionTime(f[0])
-				ftIsFromPseudo = true
+			} else if module.IsPseudoVersion(f[0]) {
+				ft, _ = module.PseudoVersionTime(f[0])
 			} else {
 				// Repo.Latest promises that this method is only called where there are
 				// no tagged versions. Ignore any tagged versions that were added in the
@@ -375,7 +346,6 @@ func (p *proxyRepo) latest() (*RevInfo, error) {
 			}
 			if bestTime.Before(ft) {
 				bestTime = ft
-				bestTimeIsFromPseudo = ftIsFromPseudo
 				bestVersion = f[0]
 			}
 		}
@@ -384,22 +354,8 @@ func (p *proxyRepo) latest() (*RevInfo, error) {
 		return nil, p.versionError("", codehost.ErrNoCommits)
 	}
 
-	if bestTimeIsFromPseudo {
-		// We parsed bestTime from the pseudo-version, but that's in UTC and we're
-		// supposed to report the timestamp as reported by the VCS.
-		// Stat the selected version to canonicalize the timestamp.
-		//
-		// TODO(bcmills): Should we also stat other versions to ensure that we
-		// report the correct Name and Short for the revision?
-		return p.Stat(bestVersion)
-	}
-
-	return &RevInfo{
-		Version: bestVersion,
-		Name:    bestVersion,
-		Short:   bestVersion,
-		Time:    bestTime,
-	}, nil
+	// Call Stat to get all the other fields, including Origin information.
+	return p.Stat(bestVersion)
 }
 
 func (p *proxyRepo) Stat(rev string) (*RevInfo, error) {
@@ -464,7 +420,8 @@ func (p *proxyRepo) Zip(dst io.Writer, version string) error {
 	if err != nil {
 		return p.versionError(version, err)
 	}
-	body, err := p.getBody("@v/" + encVer + ".zip")
+	path := "@v/" + encVer + ".zip"
+	body, err := p.getBody(path)
 	if err != nil {
 		return p.versionError(version, err)
 	}
@@ -472,6 +429,9 @@ func (p *proxyRepo) Zip(dst io.Writer, version string) error {
 
 	lr := &io.LimitedReader{R: body, N: codehost.MaxZipFile + 1}
 	if _, err := io.Copy(dst, lr); err != nil {
+		// net/http doesn't add context to Body errors, so add it here.
+		// (See https://go.dev/issue/52727.)
+		err = &url.Error{Op: "read", URL: pathpkg.Join(p.redactedURL, path), Err: err}
 		return p.versionError(version, err)
 	}
 	if lr.N <= 0 {

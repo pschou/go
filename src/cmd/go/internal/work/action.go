@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +24,7 @@ import (
 	"cmd/go/internal/cache"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
+	"cmd/go/internal/robustio"
 	"cmd/go/internal/trace"
 	"cmd/internal/buildid"
 )
@@ -37,7 +37,7 @@ type Builder struct {
 	actionCache map[cacheKey]*Action // a cache of already-constructed actions
 	mkdirCache  map[string]bool      // a cache of created directories
 	flagCache   map[[2]string]bool   // a cache of supported compiler flags
-	Print       func(args ...interface{}) (int, error)
+	Print       func(args ...any) (int, error)
 
 	IsCmdList           bool // running as part of go list; set p.Stale and additional fields below
 	NeedError           bool // list needs p.Error
@@ -120,8 +120,8 @@ type actionQueue []*Action
 func (q *actionQueue) Len() int           { return len(*q) }
 func (q *actionQueue) Swap(i, j int)      { (*q)[i], (*q)[j] = (*q)[j], (*q)[i] }
 func (q *actionQueue) Less(i, j int) bool { return (*q)[i].priority < (*q)[j].priority }
-func (q *actionQueue) Push(x interface{}) { *q = append(*q, x.(*Action)) }
-func (q *actionQueue) Pop() interface{} {
+func (q *actionQueue) Push(x any)         { *q = append(*q, x.(*Action)) }
+func (q *actionQueue) Pop() any {
 	n := len(*q) - 1
 	x := (*q)[n]
 	*q = (*q)[:n]
@@ -240,8 +240,16 @@ const (
 	ModeVetOnly = 1 << 8
 )
 
-func (b *Builder) Init() {
-	b.Print = func(a ...interface{}) (int, error) {
+// NewBuilder returns a new Builder ready for use.
+//
+// If workDir is the empty string, NewBuilder creates a WorkDir if needed
+// and arranges for it to be removed in case of an unclean exit.
+// The caller must Close the builder explicitly to clean up the WorkDir
+// before a clean exit.
+func NewBuilder(workDir string) *Builder {
+	b := new(Builder)
+
+	b.Print = func(a ...any) (int, error) {
 		return fmt.Fprint(os.Stderr, a...)
 	}
 	b.actionCache = make(map[cacheKey]*Action)
@@ -249,9 +257,14 @@ func (b *Builder) Init() {
 	b.toolIDCache = make(map[string]string)
 	b.buildIDCache = make(map[string]string)
 
-	if cfg.BuildN {
+	if workDir != "" {
+		b.WorkDir = workDir
+	} else if cfg.BuildN {
 		b.WorkDir = "$WORK"
 	} else {
+		if !buildInitStarted {
+			panic("internal error: NewBuilder called before BuildInit")
+		}
 		tmp, err := os.MkdirTemp(cfg.Getenv("GOTMPDIR"), "go-build")
 		if err != nil {
 			base.Fatalf("go: creating work dir: %v", err)
@@ -265,46 +278,64 @@ func (b *Builder) Init() {
 			tmp = abs
 		}
 		b.WorkDir = tmp
+		builderWorkDirs.Store(b, b.WorkDir)
 		if cfg.BuildX || cfg.BuildWork {
 			fmt.Fprintf(os.Stderr, "WORK=%s\n", b.WorkDir)
-		}
-		if !cfg.BuildWork {
-			workdir := b.WorkDir
-			base.AtExit(func() {
-				start := time.Now()
-				for {
-					err := os.RemoveAll(workdir)
-					if err == nil {
-						return
-					}
-
-					// On some configurations of Windows, directories containing executable
-					// files may be locked for a while after the executable exits (perhaps
-					// due to antivirus scans?). It's probably worth a little extra latency
-					// on exit to avoid filling up the user's temporary directory with leaked
-					// files. (See golang.org/issue/30789.)
-					if runtime.GOOS != "windows" || time.Since(start) >= 500*time.Millisecond {
-						fmt.Fprintf(os.Stderr, "go: failed to remove work dir: %s\n", err)
-						return
-					}
-					time.Sleep(5 * time.Millisecond)
-				}
-			})
 		}
 	}
 
 	if err := CheckGOOSARCHPair(cfg.Goos, cfg.Goarch); err != nil {
-		fmt.Fprintf(os.Stderr, "cmd/go: %v\n", err)
+		fmt.Fprintf(os.Stderr, "go: %v\n", err)
 		base.SetExitStatus(2)
 		base.Exit()
 	}
 
 	for _, tag := range cfg.BuildContext.BuildTags {
 		if strings.Contains(tag, ",") {
-			fmt.Fprintf(os.Stderr, "cmd/go: -tags space-separated list contains comma\n")
+			fmt.Fprintf(os.Stderr, "go: -tags space-separated list contains comma\n")
 			base.SetExitStatus(2)
 			base.Exit()
 		}
+	}
+
+	return b
+}
+
+var builderWorkDirs sync.Map // *Builder → WorkDir
+
+func (b *Builder) Close() error {
+	wd, ok := builderWorkDirs.Load(b)
+	if !ok {
+		return nil
+	}
+	defer builderWorkDirs.Delete(b)
+
+	if b.WorkDir != wd.(string) {
+		base.Errorf("go: internal error: Builder WorkDir unexpectedly changed from %s to %s", wd, b.WorkDir)
+	}
+
+	if !cfg.BuildWork {
+		if err := robustio.RemoveAll(b.WorkDir); err != nil {
+			return err
+		}
+	}
+	b.WorkDir = ""
+	return nil
+}
+
+func closeBuilders() {
+	leakedBuilders := 0
+	builderWorkDirs.Range(func(bi, _ any) bool {
+		leakedBuilders++
+		if err := bi.(*Builder).Close(); err != nil {
+			base.Errorf("go: %v", err)
+		}
+		return true
+	})
+
+	if leakedBuilders > 0 && base.GetExitStatus() == 0 {
+		fmt.Fprintf(os.Stderr, "go: internal error: Builder leaked on successful exit\n")
+		base.SetExitStatus(1)
 	}
 }
 
@@ -341,10 +372,10 @@ func readpkglist(shlibpath string) (pkgs []*load.Package) {
 		scanner := bufio.NewScanner(bytes.NewBuffer(data))
 		for scanner.Scan() {
 			t := scanner.Text()
-			if strings.HasPrefix(t, "pkgpath ") {
-				t = strings.TrimPrefix(t, "pkgpath ")
+			var found bool
+			if t, found = strings.CutPrefix(t, "pkgpath "); found {
 				t = strings.TrimSuffix(t, ";")
-				pkgs = append(pkgs, load.LoadImportWithFlags(t, base.Cwd, nil, &stk, nil, 0))
+				pkgs = append(pkgs, load.LoadImportWithFlags(t, base.Cwd(), nil, &stk, nil, 0))
 			}
 		}
 	} else {
@@ -355,7 +386,7 @@ func readpkglist(shlibpath string) (pkgs []*load.Package) {
 		scanner := bufio.NewScanner(bytes.NewBuffer(pkglistbytes))
 		for scanner.Scan() {
 			t := scanner.Text()
-			pkgs = append(pkgs, load.LoadImportWithFlags(t, base.Cwd, nil, &stk, nil, 0))
+			pkgs = append(pkgs, load.LoadImportWithFlags(t, base.Cwd(), nil, &stk, nil, 0))
 		}
 	}
 	return
@@ -776,7 +807,7 @@ func (b *Builder) linkSharedAction(mode, depMode BuildMode, shlib string, a1 *Ac
 					}
 				}
 				var stk load.ImportStack
-				p := load.LoadImportWithFlags(pkg, base.Cwd, nil, &stk, nil, 0)
+				p := load.LoadImportWithFlags(pkg, base.Cwd(), nil, &stk, nil, 0)
 				if p.Error != nil {
 					base.Fatalf("load %s: %v", pkg, p.Error)
 				}

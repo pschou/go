@@ -5,6 +5,7 @@
 package ssa
 
 import (
+	"cmd/compile/internal/reflectdata"
 	"cmd/compile/internal/types"
 	"cmd/internal/obj"
 	"cmd/internal/objabi"
@@ -37,9 +38,11 @@ func needwb(v *Value, zeroes map[ID]ZeroRegion) bool {
 	if IsStackAddr(v.Args[0]) {
 		return false // write on stack doesn't need write barrier
 	}
-	if v.Op == OpMove && IsReadOnlyGlobalAddr(v.Args[1]) && IsNewObject(v.Args[0], v.MemoryArg()) {
-		// Copying data from readonly memory into a fresh object doesn't need a write barrier.
-		return false
+	if v.Op == OpMove && IsReadOnlyGlobalAddr(v.Args[1]) {
+		if mem, ok := IsNewObject(v.Args[0]); ok && mem == v.MemoryArg() {
+			// Copying data from readonly memory into a fresh object doesn't need a write barrier.
+			return false
+		}
 	}
 	if v.Op == OpStore && IsGlobalAddr(v.Args[1]) {
 		// Storing pointers to non-heap locations into zeroed memory doesn't need a write barrier.
@@ -77,11 +80,11 @@ func needwb(v *Value, zeroes map[ID]ZeroRegion) bool {
 // when necessary (the condition above). It rewrites store ops to branches
 // and runtime calls, like
 //
-// if writeBarrier.enabled {
-//   gcWriteBarrier(ptr, val)	// Not a regular Go call
-// } else {
-//   *ptr = val
-// }
+//	if writeBarrier.enabled {
+//		gcWriteBarrier(ptr, val)	// Not a regular Go call
+//	} else {
+//		*ptr = val
+//	}
 //
 // A sequence of WB stores for many pointer fields of a single type will
 // be emitted together, with a single branch.
@@ -160,7 +163,7 @@ func writebarrier(f *Func) {
 					last = w
 					end = i + 1
 				}
-			case OpVarDef, OpVarLive, OpVarKill:
+			case OpVarDef, OpVarLive:
 				continue
 			default:
 				if last == nil {
@@ -270,13 +273,13 @@ func writebarrier(f *Func) {
 			case OpMoveWB:
 				fn = typedmemmove
 				val = w.Args[1]
-				typ = w.Aux.(*types.Type).Symbol()
+				typ = reflectdata.TypeLinksym(w.Aux.(*types.Type))
 				nWBops--
 			case OpZeroWB:
 				fn = typedmemclr
-				typ = w.Aux.(*types.Type).Symbol()
+				typ = reflectdata.TypeLinksym(w.Aux.(*types.Type))
 				nWBops--
-			case OpVarDef, OpVarLive, OpVarKill:
+			case OpVarDef, OpVarLive:
 			}
 
 			// then block: emit write barrier call
@@ -298,7 +301,7 @@ func writebarrier(f *Func) {
 				}
 				// Note that we set up a writebarrier function call.
 				f.fe.SetWBPos(pos)
-			case OpVarDef, OpVarLive, OpVarKill:
+			case OpVarDef, OpVarLive:
 				memThen = bThen.NewValue1A(pos, w.Op, types.TypeMem, w.Aux, memThen)
 			}
 
@@ -312,15 +315,9 @@ func writebarrier(f *Func) {
 			case OpZeroWB:
 				memElse = bElse.NewValue2I(pos, OpZero, types.TypeMem, w.AuxInt, ptr, memElse)
 				memElse.Aux = w.Aux
-			case OpVarDef, OpVarLive, OpVarKill:
+			case OpVarDef, OpVarLive:
 				memElse = bElse.NewValue1A(pos, w.Op, types.TypeMem, w.Aux, memElse)
 			}
-		}
-
-		// mark volatile temps dead
-		for _, c := range volatiles {
-			tmpNode := c.tmp.Aux
-			memThen = bThen.NewValue1A(memThen.Pos, OpVarKill, types.TypeMem, tmpNode, memThen)
 		}
 
 		// merge memory
@@ -388,11 +385,15 @@ func (f *Func) computeZeroMap() map[ID]ZeroRegion {
 	// Find new objects.
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
-			if v.Op != OpLoad {
-				continue
-			}
-			mem := v.MemoryArg()
-			if IsNewObject(v, mem) {
+			if mem, ok := IsNewObject(v); ok {
+				// While compiling package runtime itself, we might see user
+				// calls to newobject, which will have result type
+				// unsafe.Pointer instead. We can't easily infer how large the
+				// allocated memory is, so just skip it.
+				if types.LocalPkg.Path == "runtime" && v.Type.IsUnsafePtr() {
+					continue
+				}
+
 				nptr := v.Type.Elem().Size() / ptrSize
 				if nptr > 64 {
 					nptr = 64
@@ -482,38 +483,56 @@ func (f *Func) computeZeroMap() map[ID]ZeroRegion {
 func wbcall(pos src.XPos, b *Block, fn, typ *obj.LSym, ptr, val, mem, sp, sb *Value) *Value {
 	config := b.Func.Config
 
-	// put arguments on stack
-	off := config.ctxt.FixedFrameSize()
+	var wbargs []*Value
+	// TODO (register args) this is a bit of a hack.
+	inRegs := b.Func.ABIDefault == b.Func.ABI1 && len(config.intParamRegs) >= 3
 
-	var ACArgs []Param
+	// put arguments on stack
+	off := config.ctxt.Arch.FixedFrameSize
+
+	var argTypes []*types.Type
 	if typ != nil { // for typedmemmove
 		taddr := b.NewValue1A(pos, OpAddr, b.Func.Config.Types.Uintptr, typ, sb)
+		argTypes = append(argTypes, b.Func.Config.Types.Uintptr)
 		off = round(off, taddr.Type.Alignment())
-		arg := b.NewValue1I(pos, OpOffPtr, taddr.Type.PtrTo(), off, sp)
-		mem = b.NewValue3A(pos, OpStore, types.TypeMem, ptr.Type, arg, taddr, mem)
-		ACArgs = append(ACArgs, Param{Type: b.Func.Config.Types.Uintptr, Offset: int32(off)})
+		if inRegs {
+			wbargs = append(wbargs, taddr)
+		} else {
+			arg := b.NewValue1I(pos, OpOffPtr, taddr.Type.PtrTo(), off, sp)
+			mem = b.NewValue3A(pos, OpStore, types.TypeMem, ptr.Type, arg, taddr, mem)
+		}
 		off += taddr.Type.Size()
 	}
 
+	argTypes = append(argTypes, ptr.Type)
 	off = round(off, ptr.Type.Alignment())
-	arg := b.NewValue1I(pos, OpOffPtr, ptr.Type.PtrTo(), off, sp)
-	mem = b.NewValue3A(pos, OpStore, types.TypeMem, ptr.Type, arg, ptr, mem)
-	ACArgs = append(ACArgs, Param{Type: ptr.Type, Offset: int32(off)})
+	if inRegs {
+		wbargs = append(wbargs, ptr)
+	} else {
+		arg := b.NewValue1I(pos, OpOffPtr, ptr.Type.PtrTo(), off, sp)
+		mem = b.NewValue3A(pos, OpStore, types.TypeMem, ptr.Type, arg, ptr, mem)
+	}
 	off += ptr.Type.Size()
 
 	if val != nil {
+		argTypes = append(argTypes, val.Type)
 		off = round(off, val.Type.Alignment())
-		arg = b.NewValue1I(pos, OpOffPtr, val.Type.PtrTo(), off, sp)
-		mem = b.NewValue3A(pos, OpStore, types.TypeMem, val.Type, arg, val, mem)
-		ACArgs = append(ACArgs, Param{Type: val.Type, Offset: int32(off)})
+		if inRegs {
+			wbargs = append(wbargs, val)
+		} else {
+			arg := b.NewValue1I(pos, OpOffPtr, val.Type.PtrTo(), off, sp)
+			mem = b.NewValue3A(pos, OpStore, types.TypeMem, val.Type, arg, val, mem)
+		}
 		off += val.Type.Size()
 	}
 	off = round(off, config.PtrSize)
+	wbargs = append(wbargs, mem)
 
 	// issue call
-	mem = b.NewValue1A(pos, OpStaticCall, types.TypeMem, StaticAuxCall(fn, ACArgs, nil), mem)
-	mem.AuxInt = off - config.ctxt.FixedFrameSize()
-	return mem
+	call := b.NewValue0A(pos, OpStaticCall, types.TypeResultMem, StaticAuxCall(fn, b.Func.ABIDefault.ABIAnalyzeTypes(nil, argTypes, nil)))
+	call.AddArgs(wbargs...)
+	call.AuxInt = off - config.ctxt.Arch.FixedFrameSize
+	return b.NewValue1I(pos, OpSelectN, types.TypeMem, 0, call)
 }
 
 // round to a multiple of r, r is a power of 2
@@ -527,7 +546,7 @@ func IsStackAddr(v *Value) bool {
 		v = v.Args[0]
 	}
 	switch v.Op {
-	case OpSP, OpLocalAddr, OpSelectNAddr:
+	case OpSP, OpLocalAddr, OpSelectNAddr, OpGetCallerSP:
 		return true
 	}
 	return false
@@ -535,6 +554,9 @@ func IsStackAddr(v *Value) bool {
 
 // IsGlobalAddr reports whether v is known to be an address of a global (or nil).
 func IsGlobalAddr(v *Value) bool {
+	for v.Op == OpOffPtr || v.Op == OpAddPtr || v.Op == OpPtrIndex || v.Op == OpCopy {
+		v = v.Args[0]
+	}
 	if v.Op == OpAddr && v.Args[0].Op == OpSB {
 		return true // address of a global
 	}
@@ -559,31 +581,60 @@ func IsReadOnlyGlobalAddr(v *Value) bool {
 	return false
 }
 
-// IsNewObject reports whether v is a pointer to a freshly allocated & zeroed object at memory state mem.
-func IsNewObject(v *Value, mem *Value) bool {
-	if v.Op != OpLoad {
-		return false
+// IsNewObject reports whether v is a pointer to a freshly allocated & zeroed object,
+// if so, also returns the memory state mem at which v is zero.
+func IsNewObject(v *Value) (mem *Value, ok bool) {
+	f := v.Block.Func
+	c := f.Config
+	if f.ABIDefault == f.ABI1 && len(c.intParamRegs) >= 1 {
+		if v.Op != OpSelectN || v.AuxInt != 0 {
+			return nil, false
+		}
+		// Find the memory
+		for _, w := range v.Block.Values {
+			if w.Op == OpSelectN && w.AuxInt == 1 && w.Args[0] == v.Args[0] {
+				mem = w
+				break
+			}
+		}
+		if mem == nil {
+			return nil, false
+		}
+	} else {
+		if v.Op != OpLoad {
+			return nil, false
+		}
+		mem = v.MemoryArg()
+		if mem.Op != OpSelectN {
+			return nil, false
+		}
+		if mem.Type != types.TypeMem {
+			return nil, false
+		} // assume it is the right selection if true
 	}
-	if v.MemoryArg() != mem {
-		return false
+	call := mem.Args[0]
+	if call.Op != OpStaticCall {
+		return nil, false
 	}
-	if mem.Op != OpStaticCall {
-		return false
+	if !isSameCall(call.Aux, "runtime.newobject") {
+		return nil, false
 	}
-	if !isSameCall(mem.Aux, "runtime.newobject") {
-		return false
+	if f.ABIDefault == f.ABI1 && len(c.intParamRegs) >= 1 {
+		if v.Args[0] == call {
+			return mem, true
+		}
+		return nil, false
 	}
 	if v.Args[0].Op != OpOffPtr {
-		return false
+		return nil, false
 	}
 	if v.Args[0].Args[0].Op != OpSP {
-		return false
+		return nil, false
 	}
-	c := v.Block.Func.Config
-	if v.Args[0].AuxInt != c.ctxt.FixedFrameSize()+c.RegSize { // offset of return value
-		return false
+	if v.Args[0].AuxInt != c.ctxt.Arch.FixedFrameSize+c.RegSize { // offset of return value
+		return nil, false
 	}
-	return true
+	return mem, true
 }
 
 // IsSanitizerSafeAddr reports whether v is known to be an address
@@ -601,7 +652,8 @@ func IsSanitizerSafeAddr(v *Value) bool {
 		// read-only once initialized.
 		return true
 	case OpAddr:
-		return v.Aux.(*obj.LSym).Type == objabi.SRODATA
+		vt := v.Aux.(*obj.LSym).Type
+		return vt == objabi.SRODATA || vt == objabi.SLIBFUZZER_8BIT_COUNTER || vt == objabi.SCOVERAGE_COUNTER || vt == objabi.SCOVERAGE_AUXVAR
 	}
 	return false
 }

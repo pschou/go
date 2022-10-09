@@ -10,6 +10,7 @@ import (
 	"cmd/link/internal/ld"
 	"cmd/link/internal/loader"
 	"cmd/link/internal/sym"
+	"internal/buildcfg"
 	"io"
 	"regexp"
 )
@@ -155,7 +156,7 @@ func asmb2(ctxt *ld.Link, ldr *loader.Loader) {
 	fns := make([]*wasmFunc, len(ctxt.Textp))
 	for i, fn := range ctxt.Textp {
 		wfn := new(bytes.Buffer)
-		if ldr.SymName(fn) == "go.buildid" {
+		if ldr.SymName(fn) == "go:buildid" {
 			writeUleb128(wfn, 0) // number of sets of locals
 			writeI32Const(wfn, 0)
 			wfn.WriteByte(0x0b) // end
@@ -172,7 +173,7 @@ func asmb2(ctxt *ld.Link, ldr *loader.Loader) {
 				}
 				wfn.Write(P[off:r.Off()])
 				off = r.Off()
-				rs := ldr.ResolveABIAlias(r.Sym())
+				rs := r.Sym()
 				switch r.Type() {
 				case objabi.R_ADDR:
 					writeSleb128(wfn, ldr.SymValue(rs)+r.Add())
@@ -247,7 +248,7 @@ func writeSecSize(ctxt *ld.Link, sizeOffset int64) {
 
 func writeBuildID(ctxt *ld.Link, buildid []byte) {
 	sizeOffset := writeSecHeader(ctxt, sectionCustom)
-	writeName(ctxt.Out, "go.buildid")
+	writeName(ctxt.Out, "go:buildid")
 	ctxt.Out.Write(buildid)
 	writeSecSize(ctxt, sizeOffset)
 }
@@ -411,7 +412,7 @@ func writeElementSec(ctxt *ld.Link, numImports, numFns uint64) {
 	writeSecSize(ctxt, sizeOffset)
 }
 
-// writeElementSec writes the section that provides the function bodies for the functions
+// writeCodeSec writes the section that provides the function bodies for the functions
 // declared by the "func" section.
 func writeCodeSec(ctxt *ld.Link, fns []*wasmFunc) {
 	sizeOffset := writeSecHeader(ctxt, sectionCode)
@@ -506,20 +507,20 @@ func writeProducerSec(ctxt *ld.Link) {
 
 	writeUleb128(ctxt.Out, 2) // number of fields
 
-	writeName(ctxt.Out, "language")     // field name
-	writeUleb128(ctxt.Out, 1)           // number of values
-	writeName(ctxt.Out, "Go")           // value: name
-	writeName(ctxt.Out, objabi.Version) // value: version
+	writeName(ctxt.Out, "language")       // field name
+	writeUleb128(ctxt.Out, 1)             // number of values
+	writeName(ctxt.Out, "Go")             // value: name
+	writeName(ctxt.Out, buildcfg.Version) // value: version
 
 	writeName(ctxt.Out, "processed-by")   // field name
 	writeUleb128(ctxt.Out, 1)             // number of values
 	writeName(ctxt.Out, "Go cmd/compile") // value: name
-	writeName(ctxt.Out, objabi.Version)   // value: version
+	writeName(ctxt.Out, buildcfg.Version) // value: version
 
 	writeSecSize(ctxt, sizeOffset)
 }
 
-var nameRegexp = regexp.MustCompile(`[^\w\.]`)
+var nameRegexp = regexp.MustCompile(`[^\w.]`)
 
 // writeNameSec writes an optional section that assigns names to the functions declared by the "func" section.
 // The names are only used by WebAssembly stack traces, debuggers and decompilers.

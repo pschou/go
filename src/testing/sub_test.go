@@ -476,13 +476,14 @@ func TestTRun(t *T) {
 	}}
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *T) {
-			ctx := newTestContext(tc.maxPar, newMatcher(regexp.MatchString, "", ""))
-			buf := &bytes.Buffer{}
+			ctx := newTestContext(tc.maxPar, allMatcher())
+			buf := &strings.Builder{}
 			root := &T{
 				common: common{
-					signal: make(chan bool),
-					name:   "Test",
-					w:      buf,
+					signal:  make(chan bool),
+					barrier: make(chan bool),
+					name:    "Test",
+					w:       buf,
 				},
 				context: ctx,
 			}
@@ -656,10 +657,14 @@ func TestBRun(t *T) {
 			}
 		},
 	}}
+	hideStdoutForTesting = true
+	defer func() {
+		hideStdoutForTesting = false
+	}()
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *T) {
 			var ok bool
-			buf := &bytes.Buffer{}
+			buf := &strings.Builder{}
 			// This is almost like the Benchmark function, except that we override
 			// the benchtime and catch the failure result of the subbenchmark.
 			root := &B{
@@ -669,7 +674,7 @@ func TestBRun(t *T) {
 					w:      buf,
 				},
 				benchFunc: func(b *B) { ok = b.Run("test", tc.f) }, // Use Run to catch failure.
-				benchTime: benchTimeFlag{d: 1 * time.Microsecond},
+				benchTime: durationOrCountFlag{d: 1 * time.Microsecond},
 			}
 			if tc.chatty {
 				root.chatty = newChattyPrinter(root.w)
@@ -723,7 +728,7 @@ func TestBenchmarkReadMemStatsBeforeFirstRun(t *T) {
 	var first = true
 	Benchmark(func(b *B) {
 		if first && (b.startAllocs == 0 || b.startBytes == 0) {
-			panic(fmt.Sprintf("ReadMemStats not called before first run"))
+			panic("ReadMemStats not called before first run")
 		}
 		first = false
 	})
@@ -770,7 +775,7 @@ func TestRacyOutput(t *T) {
 	var wg sync.WaitGroup
 	root := &T{
 		common:  common{w: &funcWriter{raceDetector}},
-		context: newTestContext(1, newMatcher(regexp.MatchString, "", "")),
+		context: newTestContext(1, allMatcher()),
 	}
 	root.chatty = newChattyPrinter(root.w)
 	root.Run("", func(t *T) {
@@ -793,7 +798,7 @@ func TestRacyOutput(t *T) {
 
 // The late log message did not include the test name.  Issue 29388.
 func TestLogAfterComplete(t *T) {
-	ctx := newTestContext(1, newMatcher(regexp.MatchString, "", ""))
+	ctx := newTestContext(1, allMatcher())
 	var buf bytes.Buffer
 	t1 := &T{
 		common: common{
@@ -822,7 +827,7 @@ func TestLogAfterComplete(t *T) {
 						c2 <- fmt.Sprintf("subtest panic with unexpected value %v", p)
 						return
 					}
-					const want = "Log in goroutine after TestLateLog has completed"
+					const want = "Log in goroutine after TestLateLog has completed: log after test"
 					if !strings.Contains(s, want) {
 						c2 <- fmt.Sprintf("subtest panic %q does not contain %q", s, want)
 					}

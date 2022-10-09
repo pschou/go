@@ -8,6 +8,7 @@ import (
 	"bytes"
 	. "strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func check(t *testing.T, b *Builder, want string) {
@@ -108,6 +109,15 @@ func TestBuilderGrow(t *testing.T) {
 			t.Errorf("growLen=%d: got %d allocs during Write; want %v", growLen, g, w)
 		}
 	}
+	// when growLen < 0, should panic
+	var a Builder
+	n := -1
+	defer func() {
+		if r := recover(); r == nil {
+			t.Errorf("a.Grow(%d) should panic()", n)
+		}
+	}()
+	a.Grow(n)
 }
 
 func TestBuilderWrite2(t *testing.T) {
@@ -298,6 +308,16 @@ func TestBuilderCopyPanic(t *testing.T) {
 		if got := <-didPanic; got != tt.wantPanic {
 			t.Errorf("%s: panicked = %v; want %v", tt.name, got, tt.wantPanic)
 		}
+	}
+}
+
+func TestBuilderWriteInvalidRune(t *testing.T) {
+	// Invalid runes, including negative ones, should be written as
+	// utf8.RuneError.
+	for _, r := range []rune{-1, utf8.MaxRune + 1} {
+		var b Builder
+		b.WriteRune(r)
+		check(t, &b, "\uFFFD")
 	}
 }
 

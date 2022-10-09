@@ -5,7 +5,7 @@
 // Only run where builders (build.golang.org) have
 // access to compiled packages for import.
 //
-// +build !arm,!arm64
+//go:build !arm && !arm64
 
 package types_test
 
@@ -16,7 +16,6 @@ package types_test
 // from source, use golang.org/x/tools/go/loader.
 
 import (
-	"bytes"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -72,9 +71,9 @@ func Unused() { {}; {{ var x int; _ = x }} } // make sure empty block scopes get
 
 	// Print the tree of scopes.
 	// For determinism, we redact addresses.
-	var buf bytes.Buffer
+	var buf strings.Builder
 	pkg.Scope().WriteTo(&buf, 0, true)
-	rx := regexp.MustCompile(` 0x[a-fA-F0-9]*`)
+	rx := regexp.MustCompile(` 0x[a-fA-F\d]*`)
 	fmt.Println(rx.ReplaceAllString(buf.String(), ""))
 
 	// Output:
@@ -233,7 +232,7 @@ func fib(x int) int {
 	fmt.Println("Types and Values of each expression:")
 	items = nil
 	for expr, tv := range info.Types {
-		var buf bytes.Buffer
+		var buf strings.Builder
 		posn := fset.Position(expr.Pos())
 		tvstr := tv.Type.String()
 		if tv.Value != nil {
@@ -279,7 +278,7 @@ func fib(x int) int {
 	//
 	// Types and Values of each expression:
 	//  4: 8 | string              | type    : string
-	//  6:15 | len                 | builtin : func(string) int
+	//  6:15 | len                 | builtin : func(fib.S) int
 	//  6:15 | len(b)              | value   : int
 	//  6:19 | b                   | var     : fib.S
 	//  6:23 | S                   | type    : fib.S
@@ -328,7 +327,7 @@ func mode(tv types.TypeAndValue) string {
 }
 
 func exprString(fset *token.FileSet, expr ast.Expr) string {
-	var buf bytes.Buffer
+	var buf strings.Builder
 	format.Node(&buf, fset, expr)
 	return buf.String()
 }

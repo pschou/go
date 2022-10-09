@@ -5,8 +5,8 @@
 package poll
 
 import (
-	"internal/syscall/unix"
-	"sync/atomic"
+	"runtime"
+	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -17,29 +17,31 @@ const (
 
 	// maxSpliceSize is the maximum amount of data Splice asks
 	// the kernel to move in a single call to splice(2).
-	maxSpliceSize = 4 << 20
+	// We use 1MB as Splice writes data through a pipe, and 1MB is the default maximum pipe buffer size,
+	// which is determined by /proc/sys/fs/pipe-max-size.
+	maxSpliceSize = 1 << 20
 )
 
 // Splice transfers at most remain bytes of data from src to dst, using the
 // splice system call to minimize copies of data from and to userspace.
 //
-// Splice creates a temporary pipe, to serve as a buffer for the data transfer.
+// Splice gets a pipe buffer from the pool or creates a new one if needed, to serve as a buffer for the data transfer.
 // src and dst must both be stream-oriented sockets.
 //
 // If err != nil, sc is the system call which caused the error.
 func Splice(dst, src *FD, remain int64) (written int64, handled bool, sc string, err error) {
-	prfd, pwfd, sc, err := newTempPipe()
+	p, sc, err := getPipe()
 	if err != nil {
 		return 0, false, sc, err
 	}
-	defer destroyTempPipe(prfd, pwfd)
+	defer putPipe(p)
 	var inPipe, n int
 	for err == nil && remain > 0 {
 		max := maxSpliceSize
 		if int64(max) > remain {
 			max = int(remain)
 		}
-		inPipe, err = spliceDrain(pwfd, src, max)
+		inPipe, err = spliceDrain(p.wfd, src, max)
 		// The operation is considered handled if splice returns no
 		// error, or an error other than EINVAL. An EINVAL means the
 		// kernel does not support splice for the socket type of src.
@@ -52,13 +54,16 @@ func Splice(dst, src *FD, remain int64) (written int64, handled bool, sc string,
 		// If inPipe == 0 && err == nil, src is at EOF, and the
 		// transfer is complete.
 		handled = handled || (err != syscall.EINVAL)
-		if err != nil || (inPipe == 0 && err == nil) {
+		if err != nil || inPipe == 0 {
 			break
 		}
-		n, err = splicePump(dst, prfd, inPipe)
+		p.data += inPipe
+
+		n, err = splicePump(dst, p.rfd, inPipe)
 		if n > 0 {
 			written += int64(n)
 			remain -= int64(n)
+			p.data -= n
 		}
 	}
 	if err != nil {
@@ -149,46 +154,78 @@ func splice(out int, in int, max int, flags int) (int, error) {
 	return int(n), err
 }
 
-var disableSplice unsafe.Pointer
-
-// newTempPipe sets up a temporary pipe for a splice operation.
-func newTempPipe() (prfd, pwfd int, sc string, err error) {
-	p := (*bool)(atomic.LoadPointer(&disableSplice))
-	if p != nil && *p {
-		return -1, -1, "splice", syscall.EINVAL
-	}
-
-	var fds [2]int
-	// pipe2 was added in 2.6.27 and our minimum requirement is 2.6.23, so it
-	// might not be implemented. Falling back to pipe is possible, but prior to
-	// 2.6.29 splice returns -EAGAIN instead of 0 when the connection is
-	// closed.
-	const flags = syscall.O_CLOEXEC | syscall.O_NONBLOCK
-	if err := syscall.Pipe2(fds[:], flags); err != nil {
-		return -1, -1, "pipe2", err
-	}
-
-	if p == nil {
-		p = new(bool)
-		defer atomic.StorePointer(&disableSplice, unsafe.Pointer(p))
-
-		// F_GETPIPE_SZ was added in 2.6.35, which does not have the -EAGAIN bug.
-		if _, _, errno := syscall.Syscall(unix.FcntlSyscall, uintptr(fds[0]), syscall.F_GETPIPE_SZ, 0); errno != 0 {
-			*p = true
-			destroyTempPipe(fds[0], fds[1])
-			return -1, -1, "fcntl", errno
-		}
-	}
-
-	return fds[0], fds[1], "", nil
+type splicePipeFields struct {
+	rfd  int
+	wfd  int
+	data int
 }
 
-// destroyTempPipe destroys a temporary pipe.
-func destroyTempPipe(prfd, pwfd int) error {
-	err := CloseFunc(prfd)
-	err1 := CloseFunc(pwfd)
-	if err == nil {
-		return err1
+type splicePipe struct {
+	splicePipeFields
+
+	// We want to use a finalizer, so ensure that the size is
+	// large enough to not use the tiny allocator.
+	_ [24 - unsafe.Sizeof(splicePipeFields{})%24]byte
+}
+
+// splicePipePool caches pipes to avoid high-frequency construction and destruction of pipe buffers.
+// The garbage collector will free all pipes in the sync.Pool periodically, thus we need to set up
+// a finalizer for each pipe to close its file descriptors before the actual GC.
+var splicePipePool = sync.Pool{New: newPoolPipe}
+
+func newPoolPipe() any {
+	// Discard the error which occurred during the creation of pipe buffer,
+	// redirecting the data transmission to the conventional way utilizing read() + write() as a fallback.
+	p := newPipe()
+	if p == nil {
+		return nil
 	}
-	return err
+	runtime.SetFinalizer(p, destroyPipe)
+	return p
+}
+
+// getPipe tries to acquire a pipe buffer from the pool or create a new one with newPipe() if it gets nil from the cache.
+//
+// Note that it may fail to create a new pipe buffer by newPipe(), in which case getPipe() will return a generic error
+// and system call name splice in a string as the indication.
+func getPipe() (*splicePipe, string, error) {
+	v := splicePipePool.Get()
+	if v == nil {
+		return nil, "splice", syscall.EINVAL
+	}
+	return v.(*splicePipe), "", nil
+}
+
+func putPipe(p *splicePipe) {
+	// If there is still data left in the pipe,
+	// then close and discard it instead of putting it back into the pool.
+	if p.data != 0 {
+		runtime.SetFinalizer(p, nil)
+		destroyPipe(p)
+		return
+	}
+	splicePipePool.Put(p)
+}
+
+// newPipe sets up a pipe for a splice operation.
+func newPipe() *splicePipe {
+	var fds [2]int
+	if err := syscall.Pipe2(fds[:], syscall.O_CLOEXEC|syscall.O_NONBLOCK); err != nil {
+		return nil
+	}
+
+	// Splice will loop writing maxSpliceSize bytes from the source to the pipe,
+	// and then write those bytes from the pipe to the destination.
+	// Set the pipe buffer size to maxSpliceSize to optimize that.
+	// Ignore errors here, as a smaller buffer size will work,
+	// although it will require more system calls.
+	fcntl(fds[0], syscall.F_SETPIPE_SZ, maxSpliceSize)
+
+	return &splicePipe{splicePipeFields: splicePipeFields{rfd: fds[0], wfd: fds[1]}}
+}
+
+// destroyPipe destroys a pipe.
+func destroyPipe(p *splicePipe) {
+	CloseFunc(p.rfd)
+	CloseFunc(p.wfd)
 }

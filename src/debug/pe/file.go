@@ -22,7 +22,7 @@ const seekStart = 0
 // A File represents an open PE file.
 type File struct {
 	FileHeader
-	OptionalHeader interface{} // of type *OptionalHeader32 or *OptionalHeader64
+	OptionalHeader any // of type *OptionalHeader32 or *OptionalHeader64
 	Sections       []*Section
 	Symbols        []*Symbol    // COFF symbols with auxiliary symbol records removed
 	COFFSymbols    []COFFSymbol // all COFF symbols (including auxiliary symbol records)
@@ -75,7 +75,7 @@ func NewFile(r io.ReaderAt) (*File, error) {
 		var sign [4]byte
 		r.ReadAt(sign[:], signoff)
 		if !(sign[0] == 'P' && sign[1] == 'E' && sign[2] == 0 && sign[3] == 0) {
-			return nil, fmt.Errorf("Invalid PE COFF file signature of %v.", sign)
+			return nil, fmt.Errorf("invalid PE file signature: % x", sign)
 		}
 		base = signoff + 4
 	} else {
@@ -86,9 +86,17 @@ func NewFile(r io.ReaderAt) (*File, error) {
 		return nil, err
 	}
 	switch f.FileHeader.Machine {
-	case IMAGE_FILE_MACHINE_UNKNOWN, IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386:
+	case IMAGE_FILE_MACHINE_AMD64,
+		IMAGE_FILE_MACHINE_ARM64,
+		IMAGE_FILE_MACHINE_ARMNT,
+		IMAGE_FILE_MACHINE_I386,
+		IMAGE_FILE_MACHINE_RISCV32,
+		IMAGE_FILE_MACHINE_RISCV64,
+		IMAGE_FILE_MACHINE_RISCV128,
+		IMAGE_FILE_MACHINE_UNKNOWN:
+		// ok
 	default:
-		return nil, fmt.Errorf("Unrecognised COFF file header machine value of 0x%x.", f.FileHeader.Machine)
+		return nil, fmt.Errorf("unrecognized PE machine: %#x", f.FileHeader.Machine)
 	}
 
 	var err error
@@ -112,7 +120,7 @@ func NewFile(r io.ReaderAt) (*File, error) {
 	// Seek past file header.
 	_, err = sr.Seek(base+int64(binary.Size(f.FileHeader)), seekStart)
 	if err != nil {
-		return nil, fmt.Errorf("failure to seek past the file header: %v", err)
+		return nil, err
 	}
 
 	// Read optional header.
@@ -267,10 +275,14 @@ func (f *File) DWARF() (*dwarf.Data, error) {
 		return nil, err
 	}
 
-	// Look for DWARF4 .debug_types sections.
+	// Look for DWARF4 .debug_types sections and DWARF5 sections.
 	for i, s := range f.Sections {
 		suffix := dwarfSuffix(s)
-		if suffix != "types" {
+		if suffix == "" {
+			continue
+		}
+		if _, ok := dat[suffix]; ok {
+			// Already handled.
 			continue
 		}
 
@@ -279,7 +291,11 @@ func (f *File) DWARF() (*dwarf.Data, error) {
 			return nil, err
 		}
 
-		err = d.AddTypes(fmt.Sprintf("types-%d", i), b)
+		if suffix == "types" {
+			err = d.AddTypes(fmt.Sprintf("types-%d", i), b)
+		} else {
+			err = d.AddSection(".debug_"+suffix, b)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -309,7 +325,7 @@ func (f *File) ImportedSymbols() ([]string, error) {
 		return nil, nil
 	}
 
-	pe64 := f.Machine == IMAGE_FILE_MACHINE_AMD64
+	_, pe64 := f.OptionalHeader.(*OptionalHeader64)
 
 	// grab the number of data directory entries
 	var dd_length uint32
@@ -337,7 +353,10 @@ func (f *File) ImportedSymbols() ([]string, error) {
 	var ds *Section
 	ds = nil
 	for _, s := range f.Sections {
-		if s.VirtualAddress <= idd.VirtualAddress && idd.VirtualAddress < s.VirtualAddress+s.VirtualSize {
+		// We are using distance between s.VirtualAddress and idd.VirtualAddress
+		// to avoid potential overflow of uint32 caused by addition of s.VirtualSize
+		// to s.VirtualAddress.
+		if s.VirtualAddress <= idd.VirtualAddress && idd.VirtualAddress-s.VirtualAddress < s.VirtualSize {
 			ds = s
 			break
 		}
@@ -439,7 +458,7 @@ func (e *FormatError) Error() string {
 // and its size as seen in the file header.
 // It parses the given size of bytes and returns optional header. It infers whether the
 // bytes being parsed refer to 32 bit or 64 bit version of optional header.
-func readOptionalHeader(r io.ReadSeeker, sz uint16) (interface{}, error) {
+func readOptionalHeader(r io.ReadSeeker, sz uint16) (any, error) {
 	// If optional header size is 0, return empty optional header.
 	if sz == 0 {
 		return nil, nil
@@ -460,7 +479,7 @@ func readOptionalHeader(r io.ReadSeeker, sz uint16) (interface{}, error) {
 
 	// read reads from io.ReadSeeke, r, into data.
 	var err error
-	read := func(data interface{}) bool {
+	read := func(data any) bool {
 		err = binary.Read(r, binary.LittleEndian, data)
 		return err == nil
 	}
@@ -587,8 +606,8 @@ func readOptionalHeader(r io.ReadSeeker, sz uint16) (interface{}, error) {
 // its size and number of data directories as seen in optional header.
 // It parses the given size of bytes and returns given number of data directories.
 func readDataDirectories(r io.ReadSeeker, sz uint16, n uint32) ([]DataDirectory, error) {
-	ddSz := binary.Size(DataDirectory{})
-	if uint32(sz) != n*uint32(ddSz) {
+	ddSz := uint64(binary.Size(DataDirectory{}))
+	if uint64(sz) != uint64(n)*ddSz {
 		return nil, fmt.Errorf("size of data directories(%d) is inconsistent with number of data directories(%d)", sz, n)
 	}
 

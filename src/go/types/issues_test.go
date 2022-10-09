@@ -7,7 +7,6 @@
 package types_test
 
 import (
-	"bytes"
 	"fmt"
 	"go/ast"
 	"go/importer"
@@ -32,7 +31,7 @@ func TestIssue5770(t *testing.T) {
 	f := mustParse(t, `package p; type S struct{T}`)
 	conf := Config{Importer: importer.Default()}
 	_, err := conf.Check(f.Name.Name, fset, []*ast.File{f}, nil) // do not crash
-	want := "undeclared name: T"
+	const want = "undefined: T"
 	if err == nil || !strings.Contains(err.Error(), want) {
 		t.Errorf("got: %v; want: %s", err, want)
 	}
@@ -289,11 +288,11 @@ func TestIssue22525(t *testing.T) {
 	conf := Config{Error: func(err error) { got += err.Error() + "\n" }}
 	conf.Check(f.Name.Name, fset, []*ast.File{f}, nil) // do not crash
 	want := `
-1:27: a declared but not used
-1:30: b declared but not used
-1:33: c declared but not used
-1:36: d declared but not used
-1:39: e declared but not used
+1:27: a declared and not used
+1:30: b declared and not used
+1:33: c declared and not used
+1:36: d declared and not used
+1:39: e declared and not used
 `
 	if got != want {
 		t.Errorf("got: %swant: %s", got, want)
@@ -385,9 +384,9 @@ func TestIssue28005(t *testing.T) {
 			}
 		}
 		if obj == nil {
-			t.Fatal("interface not found")
+			t.Fatal("object X not found")
 		}
-		iface := obj.Type().Underlying().(*Interface) // I must be an interface
+		iface := obj.Type().Underlying().(*Interface) // object X must be an interface
 
 		// Each iface method m is embedded; and m's receiver base type name
 		// must match the method's name per the choice in the source file.
@@ -429,7 +428,7 @@ func TestIssue29029(t *testing.T) {
 
 	// printInfo prints the *Func definitions recorded in info, one *Func per line.
 	printInfo := func(info *Info) string {
-		var buf bytes.Buffer
+		var buf strings.Builder
 		for _, obj := range info.Defs {
 			if fn, ok := obj.(*Func); ok {
 				fmt.Fprintln(&buf, fn)
@@ -477,7 +476,7 @@ func TestIssue34151(t *testing.T) {
 	}
 
 	bast := mustParse(t, bsrc)
-	conf := Config{Importer: importHelper{a}}
+	conf := Config{Importer: importHelper{pkg: a}}
 	b, err := conf.Check(bast.Name.Name, fset, []*ast.File{bast}, nil)
 	if err != nil {
 		t.Errorf("package %s failed to typecheck: %v", b.Name(), err)
@@ -485,14 +484,18 @@ func TestIssue34151(t *testing.T) {
 }
 
 type importHelper struct {
-	pkg *Package
+	pkg      *Package
+	fallback Importer
 }
 
 func (h importHelper) Import(path string) (*Package, error) {
-	if path != h.pkg.Path() {
+	if path == h.pkg.Path() {
+		return h.pkg, nil
+	}
+	if h.fallback == nil {
 		return nil, fmt.Errorf("got package path %q; want %q", path, h.pkg.Path())
 	}
-	return h.pkg, nil
+	return h.fallback.Import(path)
 }
 
 // TestIssue34921 verifies that we don't update an imported type's underlying
@@ -516,7 +519,7 @@ func TestIssue34921(t *testing.T) {
 	var pkg *Package
 	for _, src := range sources {
 		f := mustParse(t, src)
-		conf := Config{Importer: importHelper{pkg}}
+		conf := Config{Importer: importHelper{pkg: pkg}}
 		res, err := conf.Check(f.Name.Name, fset, []*ast.File{f}, nil)
 		if err != nil {
 			t.Errorf("%q failed to typecheck: %v", src, err)
@@ -548,4 +551,152 @@ func TestIssue43088(t *testing.T) {
 	// These calls must terminate (no endless recursion).
 	Comparable(T1)
 	Comparable(T2)
+}
+
+func TestIssue44515(t *testing.T) {
+	typ := Unsafe.Scope().Lookup("Pointer").Type()
+
+	got := TypeString(typ, nil)
+	want := "unsafe.Pointer"
+	if got != want {
+		t.Errorf("got %q; want %q", got, want)
+	}
+
+	qf := func(pkg *Package) string {
+		if pkg == Unsafe {
+			return "foo"
+		}
+		return ""
+	}
+	got = TypeString(typ, qf)
+	want = "foo.Pointer"
+	if got != want {
+		t.Errorf("got %q; want %q", got, want)
+	}
+}
+
+func TestIssue43124(t *testing.T) {
+	// TODO(rFindley) move this to testdata by enhancing support for importing.
+
+	// All involved packages have the same name (template). Error messages should
+	// disambiguate between text/template and html/template by printing the full
+	// path.
+	const (
+		asrc = `package a; import "text/template"; func F(template.Template) {}; func G(int) {}`
+		bsrc = `
+package b
+
+import (
+	"a"
+	"html/template"
+)
+
+func _() {
+	// Packages should be fully qualified when there is ambiguity within the
+	// error string itself.
+	a.F(template /* ERROR cannot use.*html/template.* as .*text/template */ .Template{})
+}
+`
+		csrc = `
+package c
+
+import (
+	"a"
+	"fmt"
+	"html/template"
+)
+
+// Issue #46905: make sure template is not the first package qualified.
+var _ fmt.Stringer = 1 // ERROR cannot use 1.*as fmt\.Stringer
+
+// Packages should be fully qualified when there is ambiguity in reachable
+// packages. In this case both a (and for that matter html/template) import
+// text/template.
+func _() { a.G(template /* ERROR cannot use .*html/template.*Template */ .Template{}) }
+`
+
+		tsrc = `
+package template
+
+import "text/template"
+
+type T int
+
+// Verify that the current package name also causes disambiguation.
+var _ T = template /* ERROR cannot use.*text/template.* as T value */.Template{}
+`
+	)
+
+	a, err := pkgFor("a", asrc, nil)
+	if err != nil {
+		t.Fatalf("package a failed to typecheck: %v", err)
+	}
+	imp := importHelper{pkg: a, fallback: importer.Default()}
+
+	testFiles(t, nil, []string{"b.go"}, [][]byte{[]byte(bsrc)}, false, imp)
+	testFiles(t, nil, []string{"c.go"}, [][]byte{[]byte(csrc)}, false, imp)
+	testFiles(t, nil, []string{"t.go"}, [][]byte{[]byte(tsrc)}, false, imp)
+}
+
+func TestIssue50646(t *testing.T) {
+	anyType := Universe.Lookup("any").Type()
+	comparableType := Universe.Lookup("comparable").Type()
+
+	if !Comparable(anyType) {
+		t.Errorf("any is not a comparable type")
+	}
+	if !Comparable(comparableType) {
+		t.Errorf("comparable is not a comparable type")
+	}
+
+	if Implements(anyType, comparableType.Underlying().(*Interface)) {
+		t.Errorf("any implements comparable")
+	}
+	if !Implements(comparableType, anyType.(*Interface)) {
+		t.Errorf("comparable does not implement any")
+	}
+
+	if AssignableTo(anyType, comparableType) {
+		t.Errorf("any assignable to comparable")
+	}
+	if !AssignableTo(comparableType, anyType) {
+		t.Errorf("comparable not assignable to any")
+	}
+}
+
+func TestIssue55030(t *testing.T) {
+	// makeSig makes the signature func(typ...)
+	makeSig := func(typ Type) {
+		par := NewVar(token.NoPos, nil, "", typ)
+		params := NewTuple(par)
+		NewSignatureType(nil, nil, nil, params, nil, true)
+	}
+
+	// makeSig must not panic for the following (example) types:
+	// []int
+	makeSig(NewSlice(Typ[Int]))
+
+	// string
+	makeSig(Typ[String])
+
+	// P where P's core type is string
+	{
+		P := NewTypeName(token.NoPos, nil, "P", nil) // [P string]
+		makeSig(NewTypeParam(P, NewInterfaceType(nil, []Type{Typ[String]})))
+	}
+
+	// P where P's core type is an (unnamed) slice
+	{
+		P := NewTypeName(token.NoPos, nil, "P", nil) // [P []int]
+		makeSig(NewTypeParam(P, NewInterfaceType(nil, []Type{NewSlice(Typ[Int])})))
+	}
+
+	// P where P's core type is bytestring (i.e., string or []byte)
+	{
+		t1 := NewTerm(true, Typ[String])             // ~string
+		t2 := NewTerm(false, NewSlice(Typ[Byte]))    // []byte
+		u := NewUnion([]*Term{t1, t2})               // ~string | []byte
+		P := NewTypeName(token.NoPos, nil, "P", nil) // [P ~string | []byte]
+		makeSig(NewTypeParam(P, NewInterfaceType(nil, []Type{u})))
+	}
 }

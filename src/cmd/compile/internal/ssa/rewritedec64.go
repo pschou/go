@@ -66,6 +66,14 @@ func rewriteValuedec64(v *Value) bool {
 		return rewriteValuedec64_OpOr32(v)
 	case OpOr64:
 		return rewriteValuedec64_OpOr64(v)
+	case OpRotateLeft16:
+		return rewriteValuedec64_OpRotateLeft16(v)
+	case OpRotateLeft32:
+		return rewriteValuedec64_OpRotateLeft32(v)
+	case OpRotateLeft64:
+		return rewriteValuedec64_OpRotateLeft64(v)
+	case OpRotateLeft8:
+		return rewriteValuedec64_OpRotateLeft8(v)
 	case OpRsh16Ux64:
 		return rewriteValuedec64_OpRsh16Ux64(v)
 	case OpRsh16x64:
@@ -184,12 +192,12 @@ func rewriteValuedec64_OpArg(v *Value) bool {
 	config := b.Func.Config
 	typ := &b.Func.Config.Types
 	// match: (Arg {n} [off])
-	// cond: is64BitInt(v.Type) && !config.BigEndian && v.Type.IsSigned() && !(go116lateCallExpansion && b.Func.pass.name == "decompose builtin")
+	// cond: is64BitInt(v.Type) && !config.BigEndian && v.Type.IsSigned() && !(b.Func.pass.name == "decompose builtin")
 	// result: (Int64Make (Arg <typ.Int32> {n} [off+4]) (Arg <typ.UInt32> {n} [off]))
 	for {
 		off := auxIntToInt32(v.AuxInt)
 		n := auxToSym(v.Aux)
-		if !(is64BitInt(v.Type) && !config.BigEndian && v.Type.IsSigned() && !(go116lateCallExpansion && b.Func.pass.name == "decompose builtin")) {
+		if !(is64BitInt(v.Type) && !config.BigEndian && v.Type.IsSigned() && !(b.Func.pass.name == "decompose builtin")) {
 			break
 		}
 		v.reset(OpInt64Make)
@@ -203,12 +211,12 @@ func rewriteValuedec64_OpArg(v *Value) bool {
 		return true
 	}
 	// match: (Arg {n} [off])
-	// cond: is64BitInt(v.Type) && !config.BigEndian && !v.Type.IsSigned() && !(go116lateCallExpansion && b.Func.pass.name == "decompose builtin")
+	// cond: is64BitInt(v.Type) && !config.BigEndian && !v.Type.IsSigned() && !(b.Func.pass.name == "decompose builtin")
 	// result: (Int64Make (Arg <typ.UInt32> {n} [off+4]) (Arg <typ.UInt32> {n} [off]))
 	for {
 		off := auxIntToInt32(v.AuxInt)
 		n := auxToSym(v.Aux)
-		if !(is64BitInt(v.Type) && !config.BigEndian && !v.Type.IsSigned() && !(go116lateCallExpansion && b.Func.pass.name == "decompose builtin")) {
+		if !(is64BitInt(v.Type) && !config.BigEndian && !v.Type.IsSigned() && !(b.Func.pass.name == "decompose builtin")) {
 			break
 		}
 		v.reset(OpInt64Make)
@@ -222,12 +230,12 @@ func rewriteValuedec64_OpArg(v *Value) bool {
 		return true
 	}
 	// match: (Arg {n} [off])
-	// cond: is64BitInt(v.Type) && config.BigEndian && v.Type.IsSigned() && !(go116lateCallExpansion && b.Func.pass.name == "decompose builtin")
+	// cond: is64BitInt(v.Type) && config.BigEndian && v.Type.IsSigned() && !(b.Func.pass.name == "decompose builtin")
 	// result: (Int64Make (Arg <typ.Int32> {n} [off]) (Arg <typ.UInt32> {n} [off+4]))
 	for {
 		off := auxIntToInt32(v.AuxInt)
 		n := auxToSym(v.Aux)
-		if !(is64BitInt(v.Type) && config.BigEndian && v.Type.IsSigned() && !(go116lateCallExpansion && b.Func.pass.name == "decompose builtin")) {
+		if !(is64BitInt(v.Type) && config.BigEndian && v.Type.IsSigned() && !(b.Func.pass.name == "decompose builtin")) {
 			break
 		}
 		v.reset(OpInt64Make)
@@ -241,12 +249,12 @@ func rewriteValuedec64_OpArg(v *Value) bool {
 		return true
 	}
 	// match: (Arg {n} [off])
-	// cond: is64BitInt(v.Type) && config.BigEndian && !v.Type.IsSigned() && !(go116lateCallExpansion && b.Func.pass.name == "decompose builtin")
+	// cond: is64BitInt(v.Type) && config.BigEndian && !v.Type.IsSigned() && !(b.Func.pass.name == "decompose builtin")
 	// result: (Int64Make (Arg <typ.UInt32> {n} [off]) (Arg <typ.UInt32> {n} [off+4]))
 	for {
 		off := auxIntToInt32(v.AuxInt)
 		n := auxToSym(v.Aux)
-		if !(is64BitInt(v.Type) && config.BigEndian && !v.Type.IsSigned() && !(go116lateCallExpansion && b.Func.pass.name == "decompose builtin")) {
+		if !(is64BitInt(v.Type) && config.BigEndian && !v.Type.IsSigned() && !(b.Func.pass.name == "decompose builtin")) {
 			break
 		}
 		v.reset(OpInt64Make)
@@ -1265,6 +1273,74 @@ func rewriteValuedec64_OpOr64(v *Value) bool {
 		v.AddArg2(v0, v3)
 		return true
 	}
+}
+func rewriteValuedec64_OpRotateLeft16(v *Value) bool {
+	v_1 := v.Args[1]
+	v_0 := v.Args[0]
+	// match: (RotateLeft16 x (Int64Make hi lo))
+	// result: (RotateLeft16 x lo)
+	for {
+		x := v_0
+		if v_1.Op != OpInt64Make {
+			break
+		}
+		lo := v_1.Args[1]
+		v.reset(OpRotateLeft16)
+		v.AddArg2(x, lo)
+		return true
+	}
+	return false
+}
+func rewriteValuedec64_OpRotateLeft32(v *Value) bool {
+	v_1 := v.Args[1]
+	v_0 := v.Args[0]
+	// match: (RotateLeft32 x (Int64Make hi lo))
+	// result: (RotateLeft32 x lo)
+	for {
+		x := v_0
+		if v_1.Op != OpInt64Make {
+			break
+		}
+		lo := v_1.Args[1]
+		v.reset(OpRotateLeft32)
+		v.AddArg2(x, lo)
+		return true
+	}
+	return false
+}
+func rewriteValuedec64_OpRotateLeft64(v *Value) bool {
+	v_1 := v.Args[1]
+	v_0 := v.Args[0]
+	// match: (RotateLeft64 x (Int64Make hi lo))
+	// result: (RotateLeft64 x lo)
+	for {
+		x := v_0
+		if v_1.Op != OpInt64Make {
+			break
+		}
+		lo := v_1.Args[1]
+		v.reset(OpRotateLeft64)
+		v.AddArg2(x, lo)
+		return true
+	}
+	return false
+}
+func rewriteValuedec64_OpRotateLeft8(v *Value) bool {
+	v_1 := v.Args[1]
+	v_0 := v.Args[0]
+	// match: (RotateLeft8 x (Int64Make hi lo))
+	// result: (RotateLeft8 x lo)
+	for {
+		x := v_0
+		if v_1.Op != OpInt64Make {
+			break
+		}
+		lo := v_1.Args[1]
+		v.reset(OpRotateLeft8)
+		v.AddArg2(x, lo)
+		return true
+	}
+	return false
 }
 func rewriteValuedec64_OpRsh16Ux64(v *Value) bool {
 	v_1 := v.Args[1]
@@ -2458,7 +2534,5 @@ func rewriteValuedec64_OpZeroExt8to64(v *Value) bool {
 	}
 }
 func rewriteBlockdec64(b *Block) bool {
-	switch b.Kind {
-	}
 	return false
 }

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build aix darwin dragonfly freebsd js,wasm linux netbsd openbsd solaris
+//go:build unix || (js && wasm)
 
 package os
 
@@ -66,6 +66,10 @@ type file struct {
 // making it invalid; see runtime.SetFinalizer for more information on when
 // a finalizer might be run. On Unix systems this will cause the SetDeadline
 // methods to stop working.
+// Because file descriptors can be reused, the returned file descriptor may
+// only be closed through the Close method of f, or by its finalizer during
+// garbage collection. Otherwise, during garbage collection the finalizer
+// may close an unrelated file descriptor with the same (reused) number.
 //
 // As an alternative, see the f.SyscallConn method.
 func (f *File) Fd() uintptr {
@@ -90,6 +94,10 @@ func (f *File) Fd() uintptr {
 // descriptor. On Unix systems, if the file descriptor is in
 // non-blocking mode, NewFile will attempt to return a pollable File
 // (one for which the SetDeadline methods work).
+//
+// After passing it to NewFile, fd may become invalid under the same
+// conditions described in the comments of the Fd method, and the same
+// constraints apply.
 func NewFile(fd uintptr, name string) *File {
 	kind := kindNewFile
 	if nb, err := unix.IsNonblock(int(fd)); err == nil && nb {
@@ -160,18 +168,28 @@ func newFile(fd uintptr, name string, kind newFileKind) *File {
 		}
 	}
 
-	if err := f.pfd.Init("file", pollable); err != nil {
-		// An error here indicates a failure to register
-		// with the netpoll system. That can happen for
-		// a file descriptor that is not supported by
-		// epoll/kqueue; for example, disk files on
-		// GNU/Linux systems. We assume that any real error
-		// will show up in later I/O.
-	} else if pollable {
-		// We successfully registered with netpoll, so put
-		// the file into nonblocking mode.
-		if err := syscall.SetNonblock(fdi, true); err == nil {
+	clearNonBlock := false
+	if pollable {
+		if kind == kindNonBlock {
 			f.nonblock = true
+		} else if err := syscall.SetNonblock(fdi, true); err == nil {
+			f.nonblock = true
+			clearNonBlock = true
+		} else {
+			pollable = false
+		}
+	}
+
+	// An error here indicates a failure to register
+	// with the netpoll system. That can happen for
+	// a file descriptor that is not supported by
+	// epoll/kqueue; for example, disk files on
+	// Linux systems. We assume that any real error
+	// will show up in later I/O.
+	// We do restore the blocking behavior if it was set by us.
+	if pollErr := f.pfd.Init("file", pollable); pollErr != nil && clearNonBlock {
+		if err := syscall.SetNonblock(fdi, false); err == nil {
+			f.nonblock = false
 		}
 	}
 
@@ -188,7 +206,7 @@ func epipecheck(file *File, e error) {
 	}
 }
 
-// DevNull is the name of the operating system's ``null device.''
+// DevNull is the name of the operating system's “null device.”
 // On Unix-like systems, it is "/dev/null"; on Windows, "NUL".
 const DevNull = "/dev/null"
 
@@ -238,6 +256,7 @@ func (file *file) close() error {
 	}
 	if file.dirinfo != nil {
 		file.dirinfo.close()
+		file.dirinfo = nil
 	}
 	var err error
 	if e := file.pfd.Close(); e != nil {
@@ -341,6 +360,8 @@ func Link(oldname, newname string) error {
 }
 
 // Symlink creates newname as a symbolic link to oldname.
+// On Windows, a symlink to a non-existent oldname creates a file symlink;
+// if oldname is later created as a directory the symlink will not work.
 // If there is an error, it will be of type *LinkError.
 func Symlink(oldname, newname string) error {
 	e := ignoringEINTR(func() error {

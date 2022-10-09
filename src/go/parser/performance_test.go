@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-var src = readFile("parser.go")
+var src = readFile("../printer/nodes.go")
 
 func readFile(filename string) []byte {
 	data, err := os.ReadFile(filename)
@@ -26,5 +26,29 @@ func BenchmarkParse(b *testing.B) {
 		if _, err := ParseFile(token.NewFileSet(), "", src, ParseComments); err != nil {
 			b.Fatalf("benchmark failed due to parse error: %s", err)
 		}
+	}
+}
+
+func BenchmarkParseOnly(b *testing.B) {
+	b.SetBytes(int64(len(src)))
+	for i := 0; i < b.N; i++ {
+		if _, err := ParseFile(token.NewFileSet(), "", src, ParseComments|SkipObjectResolution); err != nil {
+			b.Fatalf("benchmark failed due to parse error: %s", err)
+		}
+	}
+}
+
+func BenchmarkResolve(b *testing.B) {
+	b.SetBytes(int64(len(src)))
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		fset := token.NewFileSet()
+		file, err := ParseFile(fset, "", src, SkipObjectResolution)
+		if err != nil {
+			b.Fatalf("benchmark failed due to parse error: %s", err)
+		}
+		b.StartTimer()
+		handle := fset.File(file.Package)
+		resolveFile(file, handle, nil)
 	}
 }

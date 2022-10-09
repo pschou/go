@@ -13,6 +13,7 @@ import (
 	. "os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -74,6 +75,56 @@ func TestCopyFileRange(t *testing.T) {
 		mustSeekStart(t, dst2)
 		mustContainData(t, dst2, data) // through traditional means
 	})
+	t.Run("CopyFileItself", func(t *testing.T) {
+		hook := hookCopyFileRange(t)
+
+		f, err := os.CreateTemp("", "file-readfrom-itself-test")
+		if err != nil {
+			t.Fatalf("failed to create tmp file: %v", err)
+		}
+		t.Cleanup(func() {
+			f.Close()
+			os.Remove(f.Name())
+		})
+
+		data := []byte("hello world!")
+		if _, err := f.Write(data); err != nil {
+			t.Fatalf("failed to create and feed the file: %v", err)
+		}
+
+		if err := f.Sync(); err != nil {
+			t.Fatalf("failed to save the file: %v", err)
+		}
+
+		// Rewind it.
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			t.Fatalf("failed to rewind the file: %v", err)
+		}
+
+		// Read data from the file itself.
+		if _, err := io.Copy(f, f); err != nil {
+			t.Fatalf("failed to read from the file: %v", err)
+		}
+
+		if !hook.called || hook.written != 0 || hook.handled || hook.err != nil {
+			t.Fatalf("poll.CopyFileRange should be called and return the EINVAL error, but got hook.called=%t, hook.err=%v", hook.called, hook.err)
+		}
+
+		// Rewind it.
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			t.Fatalf("failed to rewind the file: %v", err)
+		}
+
+		data2, err := io.ReadAll(f)
+		if err != nil {
+			t.Fatalf("failed to read from the file: %v", err)
+		}
+
+		// It should wind up a double of the original data.
+		if strings.Repeat(string(data), 2) != string(data2) {
+			t.Fatalf("data mismatch: %s != %s", string(data), string(data2))
+		}
+	})
 	t.Run("NotRegular", func(t *testing.T) {
 		t.Run("BothPipes", func(t *testing.T) {
 			hook := hookCopyFileRange(t)
@@ -106,7 +157,7 @@ func TestCopyFileRange(t *testing.T) {
 				t.Fatal(err)
 			}
 			if n != int64(len(data)) {
-				t.Fatalf("transfered %d, want %d", n, len(data))
+				t.Fatalf("transferred %d, want %d", n, len(data))
 			}
 			if !hook.called {
 				t.Fatalf("should have called poll.CopyFileRange")
@@ -130,7 +181,7 @@ func TestCopyFileRange(t *testing.T) {
 				t.Fatal(err)
 			}
 			if n != int64(len(data)) {
-				t.Fatalf("transfered %d, want %d", n, len(data))
+				t.Fatalf("transferred %d, want %d", n, len(data))
 			}
 			if !hook.called {
 				t.Fatalf("should have called poll.CopyFileRange")
@@ -162,7 +213,7 @@ func TestCopyFileRange(t *testing.T) {
 				t.Fatal(err)
 			}
 			if n != int64(len(data)) {
-				t.Fatalf("transfered %d, want %d", n, len(data))
+				t.Fatalf("transferred %d, want %d", n, len(data))
 			}
 			if !hook.called {
 				t.Fatalf("should have called poll.CopyFileRange")
@@ -344,6 +395,10 @@ type copyFileRangeHook struct {
 	srcfd  int
 	remain int64
 
+	written int64
+	handled bool
+	err     error
+
 	original func(dst, src *poll.FD, remain int64) (int64, bool, error)
 }
 
@@ -354,10 +409,43 @@ func (h *copyFileRangeHook) install() {
 		h.dstfd = dst.Sysfd
 		h.srcfd = src.Sysfd
 		h.remain = remain
-		return h.original(dst, src, remain)
+		h.written, h.handled, h.err = h.original(dst, src, remain)
+		return h.written, h.handled, h.err
 	}
 }
 
 func (h *copyFileRangeHook) uninstall() {
 	*PollCopyFileRangeP = h.original
+}
+
+// On some kernels copy_file_range fails on files in /proc.
+func TestProcCopy(t *testing.T) {
+	const cmdlineFile = "/proc/self/cmdline"
+	cmdline, err := os.ReadFile(cmdlineFile)
+	if err != nil {
+		t.Skipf("can't read /proc file: %v", err)
+	}
+	in, err := os.Open(cmdlineFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	outFile := filepath.Join(t.TempDir(), "cmdline")
+	out, err := os.Create(outFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		t.Fatal(err)
+	}
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
+	copy, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(cmdline, copy) {
+		t.Errorf("copy of %q got %q want %q\n", cmdlineFile, copy, cmdline)
+	}
 }

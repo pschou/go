@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build gc
+//go:build gc
 
 package goroot
 
@@ -69,8 +69,8 @@ func (gd *gccgoDirs) init() {
 	const prefix = "libraries: ="
 	var dirs []string
 	for _, dirEntry := range dirsEntries {
-		if strings.HasPrefix(dirEntry, prefix) {
-			dirs = filepath.SplitList(strings.TrimPrefix(dirEntry, prefix))
+		if after, found := strings.CutPrefix(dirEntry, prefix); found {
+			dirs = filepath.SplitList(after)
 			break
 		}
 	}

@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"fmt"
 	"go/token"
-	"io/ioutil"
 	"os"
 	"os/exec"
 )
@@ -21,13 +20,13 @@ func run(stdin []byte, argv []string) (stdout, stderr []byte, ok bool) {
 		// Some compilers have trouble with standard input.
 		// Others have trouble with -xc.
 		// Avoid both problems by writing a file with a .c extension.
-		f, err := ioutil.TempFile("", "cgo-gcc-input-")
+		f, err := os.CreateTemp("", "cgo-gcc-input-")
 		if err != nil {
 			fatalf("%s", err)
 		}
 		name := f.Name()
 		f.Close()
-		if err := ioutil.WriteFile(name+".c", stdin, 0666); err != nil {
+		if err := os.WriteFile(name+".c", stdin, 0666); err != nil {
 			os.Remove(name)
 			fatalf("%s", err)
 		}
@@ -63,7 +62,7 @@ func run(stdin []byte, argv []string) (stdout, stderr []byte, ok bool) {
 	p.Env = append(os.Environ(), "TERM=dumb")
 	err := p.Run()
 	if _, ok := err.(*exec.ExitError); err != nil && !ok {
-		fatalf("%s", err)
+		fatalf("exec %s: %s", argv[0], err)
 	}
 	ok = p.ProcessState.Success()
 	stdout, stderr = bout.Bytes(), berr.Bytes()
@@ -88,7 +87,7 @@ func fatalf(msg string, args ...interface{}) {
 	// If we've already printed other errors, they might have
 	// caused the fatal condition. Assume they're enough.
 	if nerrors == 0 {
-		fmt.Fprintf(os.Stderr, msg+"\n", args...)
+		fmt.Fprintf(os.Stderr, "cgo: "+msg+"\n", args...)
 	}
 	os.Exit(2)
 }
@@ -106,30 +105,10 @@ func error_(pos token.Pos, msg string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "\n")
 }
 
-// isName reports whether s is a valid C identifier
-func isName(s string) bool {
-	for i, v := range s {
-		if v != '_' && (v < 'A' || v > 'Z') && (v < 'a' || v > 'z') && (v < '0' || v > '9') {
-			return false
-		}
-		if i == 0 && '0' <= v && v <= '9' {
-			return false
-		}
-	}
-	return s != ""
-}
-
 func creat(name string) *os.File {
 	f, err := os.Create(name)
 	if err != nil {
 		fatalf("%s", err)
 	}
 	return f
-}
-
-func slashToUnderscore(c rune) rune {
-	if c == '/' || c == '\\' || c == ':' {
-		c = '_'
-	}
-	return c
 }

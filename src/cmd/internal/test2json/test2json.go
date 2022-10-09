@@ -66,7 +66,7 @@ type Converter struct {
 // The input buffer needs to be able to hold any single test
 // directive line we want to recognize, like:
 //
-//     <many spaces> --- PASS: very/nested/s/u/b/t/e/s/t
+//	<many spaces> --- PASS: very/nested/s/u/b/t/e/s/t
 //
 // If anyone reports a test directive line > 4k not working, it will
 // be defensible to suggest they restructure their test or test names.
@@ -343,7 +343,7 @@ func (c *Converter) writeEvent(e *event) {
 	js, err := json.Marshal(e)
 	if err != nil {
 		// Should not happen - event is valid for json.Marshal.
-		c.w.Write([]byte(fmt.Sprintf("testjson internal error: %v\n", err)))
+		fmt.Fprintf(c.w, "testjson internal error: %v\n", err)
 		return
 	}
 	js = append(js, '\n')

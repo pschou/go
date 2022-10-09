@@ -9,7 +9,6 @@ const (
 	_EINTR  = 0x4
 	_EFAULT = 0xe
 	_EAGAIN = 0x23
-	_ENOSYS = 0x4e
 
 	_O_NONBLOCK = 0x4
 	_O_CLOEXEC  = 0x10000
@@ -24,11 +23,19 @@ const (
 	_MAP_FIXED   = 0x10
 	_MAP_STACK   = 0x4000
 
-	_MADV_FREE = 0x6
+	_MADV_DONTNEED = 0x4
+	_MADV_FREE     = 0x6
 
 	_SA_SIGINFO = 0x40
 	_SA_RESTART = 0x2
 	_SA_ONSTACK = 0x1
+
+	_PTHREAD_CREATE_DETACHED = 0x1
+
+	_F_SETFD    = 0x2
+	_F_GETFL    = 0x3
+	_F_SETFL    = 0x4
+	_FD_CLOEXEC = 0x1
 
 	_SIGHUP    = 0x1
 	_SIGINT    = 0x2
@@ -174,3 +181,10 @@ type keventt struct {
 	udata     *byte
 	pad_cgo_1 [4]byte
 }
+
+type pthread uintptr
+type pthreadattr uintptr
+type pthreadcond uintptr
+type pthreadcondattr uintptr
+type pthreadmutex uintptr
+type pthreadmutexattr uintptr

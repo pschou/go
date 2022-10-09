@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"internal/saferio"
 	"io"
 	"os"
 )
@@ -55,12 +56,7 @@ type Section struct {
 
 // Data reads and returns the contents of the Plan 9 a.out section.
 func (s *Section) Data() ([]byte, error) {
-	dat := make([]byte, s.sr.Size())
-	n, err := s.sr.ReadAt(dat, 0)
-	if n == len(dat) {
-		err = nil
-	}
-	return dat[0:n], err
+	return saferio.ReadDataAt(s.sr, uint64(s.Size), 0)
 }
 
 // Open returns a new ReadSeeker reading the Plan 9 a.out section.
@@ -82,7 +78,7 @@ type Sym struct {
 type formatError struct {
 	off int
 	msg string
-	val interface{}
+	val any
 }
 
 func (e *formatError) Error() string {
@@ -216,8 +212,10 @@ func walksymtab(data []byte, ptrsz int, fn func(sym) error) error {
 			p = p[4:]
 		}
 
-		var typ byte
-		typ = p[0] & 0x7F
+		if len(p) < 1 {
+			return &formatError{len(data), "unexpected EOF", nil}
+		}
+		typ := p[0] & 0x7F
 		s.typ = typ
 		p = p[1:]
 
@@ -301,11 +299,15 @@ func newTable(symtab []byte, ptrsz int) ([]Sym, error) {
 	return syms, nil
 }
 
+// ErrNoSymbols is returned by File.Symbols if there is no such section
+// in the File.
+var ErrNoSymbols = errors.New("no symbol section")
+
 // Symbols returns the symbol table for f.
 func (f *File) Symbols() ([]Sym, error) {
 	symtabSection := f.Section("syms")
 	if symtabSection == nil {
-		return nil, errors.New("no symbol section")
+		return nil, ErrNoSymbols
 	}
 
 	symtab, err := symtabSection.Data()

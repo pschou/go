@@ -93,10 +93,16 @@ func (tools gccgoToolchain) gc(b *Builder, a *Action, archive string, importcfg,
 			args = append(args, "-I", root)
 		}
 	}
+	if embedcfg != nil && b.gccSupportsFlag(args[:1], "-fgo-embedcfg=/dev/null") {
+		if err := b.writeFile(objdir+"embedcfg", embedcfg); err != nil {
+			return "", nil, err
+		}
+		args = append(args, "-fgo-embedcfg="+objdir+"embedcfg")
+	}
 
 	if b.gccSupportsFlag(args[:1], "-ffile-prefix-map=a=b") {
 		if cfg.BuildTrimpath {
-			args = append(args, "-ffile-prefix-map="+base.Cwd+"=.")
+			args = append(args, "-ffile-prefix-map="+base.Cwd()+"=.")
 			args = append(args, "-ffile-prefix-map="+b.WorkDir+"=/tmp/go-build")
 		}
 		if fsys.OverlayFile != "" {
@@ -108,9 +114,9 @@ func (tools gccgoToolchain) gc(b *Builder, a *Action, archive string, importcfg,
 				}
 				toPath := absPath
 				// gccgo only applies the last matching rule, so also handle the case where
-				// BuildTrimpath is true and the path is relative to base.Cwd.
-				if cfg.BuildTrimpath && str.HasFilePathPrefix(toPath, base.Cwd) {
-					toPath = "." + toPath[len(base.Cwd):]
+				// BuildTrimpath is true and the path is relative to base.Cwd().
+				if cfg.BuildTrimpath && str.HasFilePathPrefix(toPath, base.Cwd()) {
+					toPath = "." + toPath[len(base.Cwd()):]
 				}
 				args = append(args, "-ffile-prefix-map="+overlayPath+"="+toPath)
 			}
@@ -151,10 +157,7 @@ func buildImportcfgSymlinks(b *Builder, root string, importcfg []byte) error {
 		} else {
 			verb, args = line[:i], strings.TrimSpace(line[i+1:])
 		}
-		var before, after string
-		if i := strings.Index(args, "="); i >= 0 {
-			before, after = args[:i], args[i+1:]
-		}
+		before, after, _ := strings.Cut(args, "=")
 		switch verb {
 		default:
 			base.Fatalf("importcfg:%d: unknown directive %q", lineNum, verb)
@@ -566,7 +569,7 @@ func (tools gccgoToolchain) cc(b *Builder, a *Action, ofile, cfile string) error
 	}
 	defs = tools.maybePIC(defs)
 	if b.gccSupportsFlag(compiler, "-ffile-prefix-map=a=b") {
-		defs = append(defs, "-ffile-prefix-map="+base.Cwd+"=.")
+		defs = append(defs, "-ffile-prefix-map="+base.Cwd()+"=.")
 		defs = append(defs, "-ffile-prefix-map="+b.WorkDir+"=/tmp/go-build")
 	} else if b.gccSupportsFlag(compiler, "-fdebug-prefix-map=a=b") {
 		defs = append(defs, "-fdebug-prefix-map="+b.WorkDir+"=/tmp/go-build")
@@ -599,7 +602,11 @@ var gccgoToSymbolFunc func(string) string
 
 func (tools gccgoToolchain) gccgoCleanPkgpath(b *Builder, p *load.Package) string {
 	gccgoToSymbolFuncOnce.Do(func() {
-		fn, err := pkgpath.ToSymbolFunc(tools.compiler(), b.WorkDir)
+		tmpdir := b.WorkDir
+		if cfg.BuildN {
+			tmpdir = os.TempDir()
+		}
+		fn, err := pkgpath.ToSymbolFunc(tools.compiler(), tmpdir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "cmd/go: %v\n", err)
 			base.SetExitStatus(2)

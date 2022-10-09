@@ -2,8 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build linux
-// +build mips mipsle
+//go:build linux && (mips || mipsle)
 
 package runtime
 
@@ -22,7 +21,6 @@ func cputicks() int64 {
 const (
 	_SS_DISABLE  = 2
 	_NSIG        = 128 + 1
-	_SI_USER     = 0
 	_SIG_BLOCK   = 1
 	_SIG_UNBLOCK = 2
 	_SIG_SETMASK = 3

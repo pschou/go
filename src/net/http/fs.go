@@ -42,20 +42,20 @@ import (
 // An empty Dir is treated as ".".
 type Dir string
 
-// mapDirOpenError maps the provided non-nil error from opening name
+// mapOpenError maps the provided non-nil error from opening name
 // to a possibly better non-nil error. In particular, it turns OS-specific errors
-// about opening files in non-directories into fs.ErrNotExist. See Issue 18984.
-func mapDirOpenError(originalErr error, name string) error {
-	if os.IsNotExist(originalErr) || os.IsPermission(originalErr) {
+// about opening files in non-directories into fs.ErrNotExist. See Issues 18984 and 49552.
+func mapOpenError(originalErr error, name string, sep rune, stat func(string) (fs.FileInfo, error)) error {
+	if errors.Is(originalErr, fs.ErrNotExist) || errors.Is(originalErr, fs.ErrPermission) {
 		return originalErr
 	}
 
-	parts := strings.Split(name, string(filepath.Separator))
+	parts := strings.Split(name, string(sep))
 	for i := range parts {
 		if parts[i] == "" {
 			continue
 		}
-		fi, err := os.Stat(strings.Join(parts[:i+1], string(filepath.Separator)))
+		fi, err := stat(strings.Join(parts[:i+1], string(sep)))
 		if err != nil {
 			return originalErr
 		}
@@ -79,7 +79,7 @@ func (d Dir) Open(name string) (File, error) {
 	fullName := filepath.Join(dir, filepath.FromSlash(path.Clean("/"+name)))
 	f, err := os.Open(fullName)
 	if err != nil {
-		return nil, mapDirOpenError(err, fullName)
+		return nil, mapOpenError(err, fullName, filepath.Separator, os.Stat)
 	}
 	return f, nil
 }
@@ -431,7 +431,7 @@ func checkIfUnmodifiedSince(r *Request, modtime time.Time) condResult {
 	// The Last-Modified header truncates sub-second precision so
 	// the modtime needs to be truncated too.
 	modtime = modtime.Truncate(time.Second)
-	if modtime.Before(t) || modtime.Equal(t) {
+	if ret := modtime.Compare(t); ret <= 0 {
 		return condTrue
 	}
 	return condFalse
@@ -482,7 +482,7 @@ func checkIfModifiedSince(r *Request, modtime time.Time) condResult {
 	// The Last-Modified header truncates sub-second precision so
 	// the modtime needs to be truncated too.
 	modtime = modtime.Truncate(time.Second)
-	if modtime.Before(t) || modtime.Equal(t) {
+	if ret := modtime.Compare(t); ret <= 0 {
 		return condFalse
 	}
 	return condTrue
@@ -541,6 +541,7 @@ func writeNotModified(w ResponseWriter) {
 	h := w.Header()
 	delete(h, "Content-Type")
 	delete(h, "Content-Length")
+	delete(h, "Content-Encoding")
 	if h.Get("Etag") != "" {
 		delete(h, "Last-Modified")
 	}
@@ -641,7 +642,6 @@ func serveFile(w ResponseWriter, r *Request, fs FileSystem, name string, redirec
 			defer ff.Close()
 			dd, err := ff.Stat()
 			if err == nil {
-				name = index
 				d = dd
 				f = ff
 			}
@@ -670,10 +670,10 @@ func serveFile(w ResponseWriter, r *Request, fs FileSystem, name string, redirec
 // and historically Go's ServeContent always returned just "404 Not Found" for
 // all errors. We don't want to start leaking information in error messages.
 func toHTTPError(err error) (msg string, httpStatus int) {
-	if os.IsNotExist(err) {
+	if errors.Is(err, fs.ErrNotExist) {
 		return "404 page not found", StatusNotFound
 	}
-	if os.IsPermission(err) {
+	if errors.Is(err, fs.ErrPermission) {
 		return "403 Forbidden", StatusForbidden
 	}
 	// Default:
@@ -759,7 +759,9 @@ func (f ioFS) Open(name string) (File, error) {
 	}
 	file, err := f.fsys.Open(name)
 	if err != nil {
-		return nil, err
+		return nil, mapOpenError(err, name, '/', func(path string) (fs.FileInfo, error) {
+			return fs.Stat(f.fsys, path)
+		})
 	}
 	return ioFile{file}, nil
 }
@@ -815,6 +817,7 @@ func (f ioFile) Readdir(count int) ([]fs.FileInfo, error) {
 
 // FS converts fsys to a FileSystem implementation,
 // for use with FileServer and NewFileTransport.
+// The files provided by fsys must implement io.Seeker.
 func FS(fsys fs.FS) FileSystem {
 	return ioFS{fsys}
 }
@@ -829,23 +832,32 @@ func FS(fsys fs.FS) FileSystem {
 // To use the operating system's file system implementation,
 // use http.Dir:
 //
-//     http.Handle("/", http.FileServer(http.Dir("/tmp")))
+//	http.Handle("/", http.FileServer(http.Dir("/tmp")))
 //
 // To use an fs.FS implementation, use http.FS to convert it:
 //
 //	http.Handle("/", http.FileServer(http.FS(fsys)))
-//
 func FileServer(root FileSystem) Handler {
 	return &fileHandler{root}
 }
 
 func (f *fileHandler) ServeHTTP(w ResponseWriter, r *Request) {
-	upath := r.URL.Path
-	if !strings.HasPrefix(upath, "/") {
-		upath = "/" + upath
-		r.URL.Path = upath
+	const options = MethodOptions + ", " + MethodGet + ", " + MethodHead
+
+	switch r.Method {
+	case MethodGet, MethodHead:
+		if !strings.HasPrefix(r.URL.Path, "/") {
+			r.URL.Path = "/" + r.URL.Path
+		}
+		serveFile(w, r, f.root, path.Clean(r.URL.Path), true)
+
+	case MethodOptions:
+		w.Header().Set("Allow", options)
+
+	default:
+		w.Header().Set("Allow", options)
+		Error(w, "read-only", StatusMethodNotAllowed)
 	}
-	serveFile(w, r, f.root, path.Clean(upath), true)
 }
 
 // httpRange specifies the byte range to be sent to the client.
@@ -881,11 +893,11 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 		if ra == "" {
 			continue
 		}
-		i := strings.Index(ra, "-")
-		if i < 0 {
+		start, end, ok := strings.Cut(ra, "-")
+		if !ok {
 			return nil, errors.New("invalid range")
 		}
-		start, end := textproto.TrimString(ra[:i]), textproto.TrimString(ra[i+1:])
+		start, end = textproto.TrimString(start), textproto.TrimString(end)
 		var r httpRange
 		if start == "" {
 			// If no start is specified, end specifies the

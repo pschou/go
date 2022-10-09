@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build aix solaris,!illumos
+//go:build aix || (solaris && !illumos)
 
 // This code implements the filelock API using POSIX 'fcntl' locks, which attach
 // to an (inode, process) pair rather than a file descriptor. To avoid unlocking
@@ -38,8 +38,6 @@ type inodeLock struct {
 	owner File
 	queue []<-chan File
 }
-
-type token struct{}
 
 var (
 	mu     sync.Mutex

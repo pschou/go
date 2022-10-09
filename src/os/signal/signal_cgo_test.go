@@ -2,8 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build darwin dragonfly freebsd linux,!android netbsd openbsd
-// +build cgo
+//go:build (darwin || dragonfly || freebsd || (linux && !android) || netbsd || openbsd) && cgo
 
 // Note that this test does not work on Solaris: issue #22849.
 // Don't run the test on Android because at least some versions of the
@@ -90,7 +89,7 @@ func TestTerminalSignal(t *testing.T) {
 	// Start an interactive shell.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bash, "--norc", "--noprofile", "-i")
+	cmd := exec.CommandContext(ctx, bash, "--norc", "--noprofile", "--noediting", "-i")
 	// Clear HISTFILE so that we don't read or clobber the user's bash history.
 	cmd.Env = append(os.Environ(), "HISTFILE=")
 	cmd.Stdin = procTTY

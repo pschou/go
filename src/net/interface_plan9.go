@@ -6,6 +6,7 @@ package net
 
 import (
 	"errors"
+	"internal/itoa"
 	"os"
 )
 
@@ -38,8 +39,8 @@ func interfaceTable(ifindex int) ([]Interface, error) {
 
 func readInterface(i int) (*Interface, error) {
 	ifc := &Interface{
-		Index: i + 1,                        // Offset the index by one to suit the contract
-		Name:  netdir + "/ipifc/" + itoa(i), // Name is the full path to the interface path in plan9
+		Index: i + 1,                             // Offset the index by one to suit the contract
+		Name:  netdir + "/ipifc/" + itoa.Itoa(i), // Name is the full path to the interface path in plan9
 	}
 
 	ifcstat := ifc.Name + "/status"
@@ -94,9 +95,9 @@ func readInterface(i int) (*Interface, error) {
 			}
 		}
 
-		ifc.Flags = FlagUp | FlagBroadcast | FlagMulticast
+		ifc.Flags = FlagUp | FlagRunning | FlagBroadcast | FlagMulticast
 	} else {
-		ifc.Flags = FlagUp | FlagMulticast | FlagLoopback
+		ifc.Flags = FlagUp | FlagRunning | FlagMulticast | FlagLoopback
 	}
 
 	return ifc, nil

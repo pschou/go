@@ -1,4 +1,4 @@
-// Copyright 2010 The Go Authors. All rights reserved.
+// Copyright 2020 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,7 +6,6 @@ package fs
 
 import (
 	"path"
-	"runtime"
 )
 
 // A GlobFS is a file system with a Glob method.
@@ -22,7 +21,7 @@ type GlobFS interface {
 // Glob returns the names of all files matching pattern or nil
 // if there is no matching file. The syntax of patterns is the same
 // as in path.Match. The pattern may describe hierarchical names such as
-// /usr/*/bin/ed (assuming the Separator is '/').
+// usr/*/bin/ed.
 //
 // Glob ignores file system errors such as I/O errors reading directories.
 // The only possible returned error is path.ErrBadPattern, reporting that
@@ -32,6 +31,16 @@ type GlobFS interface {
 // Otherwise, Glob uses ReadDir to traverse the directory tree
 // and look for matches for the pattern.
 func Glob(fsys FS, pattern string) (matches []string, err error) {
+	return globWithLimit(fsys, pattern, 0)
+}
+
+func globWithLimit(fsys FS, pattern string, depth int) (matches []string, err error) {
+	// This limit is added to prevent stack exhaustion issues. See
+	// CVE-2022-30630.
+	const pathSeparatorsLimit = 10000
+	if depth > pathSeparatorsLimit {
+		return nil, path.ErrBadPattern
+	}
 	if fsys, ok := fsys.(GlobFS); ok {
 		return fsys.Glob(pattern)
 	}
@@ -60,9 +69,9 @@ func Glob(fsys FS, pattern string) (matches []string, err error) {
 	}
 
 	var m []string
-	m, err = Glob(fsys, dir)
+	m, err = globWithLimit(fsys, dir, depth+1)
 	if err != nil {
-		return
+		return nil, err
 	}
 	for _, d := range m {
 		matches, err = glob(fsys, d, file, matches)
@@ -111,8 +120,8 @@ func glob(fs FS, dir, pattern string, matches []string) (m []string, e error) {
 // recognized by path.Match.
 func hasMeta(path string) bool {
 	for i := 0; i < len(path); i++ {
-		c := path[i]
-		if c == '*' || c == '?' || c == '[' || runtime.GOOS == "windows" && c == '\\' {
+		switch path[i] {
+		case '*', '?', '[', '\\':
 			return true
 		}
 	}

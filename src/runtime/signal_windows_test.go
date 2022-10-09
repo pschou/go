@@ -1,4 +1,6 @@
-// +build windows
+// Copyright 2019 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 package runtime_test
 
@@ -7,7 +9,6 @@ import (
 	"bytes"
 	"fmt"
 	"internal/testenv"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -24,18 +25,15 @@ func TestVectoredHandlerDontCrashOnLibrary(t *testing.T) {
 		t.Skip("this test can only run on windows/amd64")
 	}
 	testenv.MustHaveGoBuild(t)
+	testenv.MustHaveCGO(t)
 	testenv.MustHaveExecPath(t, "gcc")
 	testprog.Lock()
 	defer testprog.Unlock()
-	dir, err := os.MkdirTemp("", "go-build")
-	if err != nil {
-		t.Fatalf("failed to create temp directory: %v", err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	// build go dll
 	dll := filepath.Join(dir, "testwinlib.dll")
-	cmd := exec.Command(testenv.GoToolPath(t), "build", "-o", dll, "--buildmode", "c-shared", "testdata/testwinlib/main.go")
+	cmd := exec.Command(testenv.GoToolPath(t), "build", "-o", dll, "-buildmode", "c-shared", "testdata/testwinlib/main.go")
 	out, err := testenv.CleanCmdEnv(cmd).CombinedOutput()
 	if err != nil {
 		t.Fatalf("failed to build go library: %s\n%s", err, out)
@@ -79,6 +77,58 @@ func sendCtrlBreak(pid int) error {
 	return nil
 }
 
+// TestCtrlHandler tests that Go can gracefully handle closing the console window.
+// See https://golang.org/issues/41884.
+func TestCtrlHandler(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+	t.Parallel()
+
+	// build go program
+	exe := filepath.Join(t.TempDir(), "test.exe")
+	cmd := exec.Command(testenv.GoToolPath(t), "build", "-o", exe, "testdata/testwinsignal/main.go")
+	out, err := testenv.CleanCmdEnv(cmd).CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to build go exe: %v\n%s", err, out)
+	}
+
+	// run test program
+	cmd = exec.Command(exe)
+	var stdout strings.Builder
+	var stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	inPipe, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("Failed to create stdin pipe: %v", err)
+	}
+	// keep inPipe alive until the end of the test
+	defer inPipe.Close()
+
+	// in a new command window
+	const _CREATE_NEW_CONSOLE = 0x00000010
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: _CREATE_NEW_CONSOLE,
+		HideWindow:    true,
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+	}()
+
+	// check child exited gracefully, did not timeout
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("Program exited with error: %v\n%s", err, &stderr)
+	}
+
+	// check child received, handled SIGTERM
+	if expected, got := syscall.SIGTERM.String(), strings.TrimSpace(stdout.String()); expected != got {
+		t.Fatalf("Expected '%s' got: %s", expected, got)
+	}
+}
+
 // TestLibraryCtrlHandler tests that Go DLL allows calling program to handle console control events.
 // See https://golang.org/issues/35965.
 func TestLibraryCtrlHandler(t *testing.T) {
@@ -89,18 +139,15 @@ func TestLibraryCtrlHandler(t *testing.T) {
 		t.Skip("this test can only run on windows/amd64")
 	}
 	testenv.MustHaveGoBuild(t)
+	testenv.MustHaveCGO(t)
 	testenv.MustHaveExecPath(t, "gcc")
 	testprog.Lock()
 	defer testprog.Unlock()
-	dir, err := os.MkdirTemp("", "go-build")
-	if err != nil {
-		t.Fatalf("failed to create temp directory: %v", err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	// build go dll
 	dll := filepath.Join(dir, "dummy.dll")
-	cmd := exec.Command(testenv.GoToolPath(t), "build", "-o", dll, "--buildmode", "c-shared", "testdata/testwinlibsignal/dummy.go")
+	cmd := exec.Command(testenv.GoToolPath(t), "build", "-o", dll, "-buildmode", "c-shared", "testdata/testwinlibsignal/dummy.go")
 	out, err := testenv.CleanCmdEnv(cmd).CombinedOutput()
 	if err != nil {
 		t.Fatalf("failed to build go library: %s\n%s", err, out)
